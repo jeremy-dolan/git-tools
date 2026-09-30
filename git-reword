@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""
+Reword a commit without replaying patches or touching the index/worktree.
+
+Requires Python 3.8+ and Git 2.46+. Put git-reword on PATH, then run:
+  git reword a1b2c3d
+  git reword -f HEAD~3
+
+The target must be a single commit reachable from HEAD. A branch or tag name
+selects the target; it is the current branch (or detached HEAD) that moves.
+The target and its descendants through HEAD receive new commit IDs, preserving
+trees, merge topology, author/committer identities and dates, and other metadata
+except signatures. Only the target's message changes. Staged, unstaged, and
+untracked files are left alone, as are other branches, tags, and remote refs.
+Notes from every local refs/notes/* namespace are copied; originals remain.
+
+Uses the configured Git editor and commit.cleanup (default: strip comments and
+excess whitespace). Leave the message unchanged or empty to cancel successfully.
+For legacy-encoded messages, configure the editor to use the original encoding.
+
+commit.gpgSign=true signs every rewritten commit; otherwise existing signatures
+are removed with a warning. Signing fails if Git cannot preserve commit content.
+Commit/rebase hooks are skipped; reference-transaction hooks still run.
+-f accepts warnings about remote-tracking refs, skipped hooks, and signature
+removal; it never bypasses safety checks. No fetch or push occurs, and absence
+of remote-tracking refs does not establish that history is unpublished.
+
+Requires a working tree with full history and no operation in progress.
+Concurrent HEAD/branch or notes changes abort publication. On failure, the edit
+directory is retained and printed. If publication is interrupted or unconfirmed,
+inspect the reflog before retrying. Success prints the old tip and, for an
+attached branch, an undo command that refuses to overwrite later commits.
+Undo leaves copied notes in place. Editor, signer, and hook side effects are
+outside these preservation guarantees.
+"""
+
+import argparse
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+class RewordError(Exception):
+    pass
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_help(sys.stderr)
+        self.exit(2)
+
+
+def display(data):
+    return data.decode("utf-8", errors="replace")
+
+
+def trace(args):
+    print("+ " + shlex.join(args), file=sys.stderr, flush=True)
+
+
+class Git:
+    def __init__(self):
+        self.env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1", GIT_OPTIONAL_LOCKS="0")
+        for key in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"):
+            if key in self.env:
+                self.env[key] = os.path.abspath(self.env[key])
+
+    def run(self, *args, data=None, env=None, allowed=(0,), write=False):
+        command = ["git", *args]
+        if write:
+            trace(command)
+        result = subprocess.run(command, input=data, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env or self.env)
+        if result.returncode not in allowed:
+            detail = display(result.stderr).strip()
+            raise RewordError(f"{shlex.join(command)} failed ({result.returncode})"
+                              + (f":\n{detail}" if detail else ""))
+        if result.stderr:
+            sys.stderr.write(display(result.stderr))
+        return result
+
+    def read(self, *args, **kwargs):
+        return self.run(*args, **kwargs).stdout
+
+    def path(self, name):
+        return Path(os.fsdecode(self.read("rev-parse", "--path-format=absolute",
+                                         "--git-path", name).rstrip(b"\n")))
+
+    def symbolic(self, ref):
+        result = self.run("symbolic-ref", "--quiet", "--no-recurse", ref, allowed=(0, 1))
+        return os.fsdecode(result.stdout.rstrip(b"\n")) if result.returncode == 0 else None
+
+    def config(self, key, boolean=False):
+        args = ["config"] + (["--type=bool"] if boolean else []) + ["--get", key]
+        result = self.run(*args, allowed=(0, 1))
+        return result.stdout.rstrip(b"\n") if result.returncode == 0 else None
+
+
+class Commit:
+    """Header records include continuation lines; messages are opaque bytes."""
+
+    def __init__(self, raw):
+        headers, separator, self.message = raw.partition(b"\n\n")
+        if not separator:
+            raise RewordError("commit has no header/message separator")
+        self.headers = []
+        for line in headers.split(b"\n"):
+            if line.startswith(b" ") and self.headers:
+                self.headers[-1] += b"\n" + line
+            elif b" " in line and not line.startswith(b" "):
+                self.headers.append(line)
+            else:
+                raise RewordError("malformed commit header")
+        for key in (b"tree", b"author", b"committer"):
+            self.one(key)
+
+    def values(self, key):
+        return [h[len(key) + 1:] for h in self.headers if h.startswith(key + b" ")]
+
+    def one(self, key):
+        values = self.values(key)
+        if len(values) != 1 or b"\n" in values[0]:
+            raise RewordError(f"expected one {display(key)} header")
+        return values[0]
+
+    @staticmethod
+    def signature(header):
+        return header.split(b" ", 1)[0] in (b"gpgsig", b"gpgsig-sha256")
+
+    def unsigned(self):
+        return b"\n".join(h for h in self.headers if not self.signature(h)) + b"\n\n" + self.message
+
+    def rewrite(self, mapping, message):
+        headers = []
+        for header in self.headers:
+            key, value = header.split(b" ", 1)
+            if self.signature(header):
+                continue
+            if key == b"parent":
+                header = b"parent " + mapping.get(value, value)
+            headers.append(header)
+        return b"\n".join(headers) + b"\n\n" + message
+
+
+def check_repository(git):
+    if git.read("rev-parse", "--is-shallow-repository").strip() != b"false":
+        raise RewordError("shallow history is unsupported; fetch the full history first")
+    if git.read("for-each-ref", "--format=%(refname)", "refs/replace"):
+        raise RewordError("remove replacement refs before rewording")
+    grafts = git.path("info/grafts")
+    if grafts.exists() and grafts.read_bytes().strip():
+        raise RewordError("history grafts are unsupported")
+    for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD",
+                 "rebase-merge", "rebase-apply", "sequencer", "BISECT_START",
+                 "NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF"):
+        if git.path(name).exists():
+            raise RewordError(f"finish or abort the operation recorded in {name} first")
+
+
+def confirm(git, target, commits, sign, force):
+    warnings = []
+    remotes = git.read("for-each-ref", "--contains=" + target.decode(),
+                       "--format=%(refname:short)", "refs/remotes").splitlines()
+    if remotes:
+        warnings.append("target is reachable from local remote-tracking refs: "
+                        + ", ".join(map(display, remotes))
+                        + "; publishing rewritten history may require a force-push")
+    hookdir = git.path("hooks")
+    hooks = [name for name in ("pre-commit", "pre-rebase", "prepare-commit-msg",
+                               "commit-msg", "post-commit", "post-rewrite")
+             if os.access(hookdir / name, os.X_OK)]
+    configured = git.run("config", "--get-regexp", r"^hook\.", allowed=(0, 1)).stdout
+    if hooks or configured:
+        warnings.append("commit/rebase hooks are not run"
+                        + (": " + ", ".join(hooks) if hooks else " (configured hooks found)"))
+    signed = sum(any(c.signature(h) for h in c.headers) for c in commits.values())
+    if signed and not sign:
+        warnings.append(f"{signed} signed commit(s) will lose their signatures; "
+                        "commit.gpgSign is off")
+    for warning in warnings:
+        print("warning: " + warning, file=sys.stderr)
+    if warnings and not force:
+        if not sys.stdin.isatty():
+            raise RewordError("confirmation needs a terminal; use -f to accept these warnings")
+        print("Continue? [y/N] ", end="", file=sys.stderr, flush=True)
+        if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+            raise RewordError("aborted")
+
+
+def cleanup_message(git, message):
+    mode = git.config("commit.cleanup")
+    if mode == b"verbatim":
+        return message
+    if mode == b"scissors":
+        marker = git.read("stripspace", "--comment-lines",
+                          data=b"------------------------ >8 ------------------------\n")
+        # Prefix a newline so a marker on the first line works too.
+        message = (b"\n" + message).partition(b"\n" + marker)[0][1:]
+    elif mode not in (None, b"default", b"strip", b"whitespace"):
+        raise RewordError(f"invalid commit.cleanup value: {display(mode)}")
+    options = ["--strip-comments"] if mode in (None, b"default", b"strip") else []
+    return git.read("stripspace", *options, data=message)
+
+
+def edit_message(git, target, original, directory):
+    # Use a private file, leaving the usual COMMIT_EDITMSG alone. Message bytes
+    # are not transcoded, and the original encoding header remains unchanged.
+    path = Path(directory) / "COMMIT_EDITMSG"
+    path.write_bytes(original)
+    editor = os.fsdecode(git.read("var", "GIT_EDITOR").rstrip(b"\n"))
+    print(f"Rewording {target.decode()[:12]}. Leave unchanged or empty to cancel.",
+          file=sys.stderr)
+    # Git editors are shell command strings, but the pathname is always an argument.
+    result = subprocess.run(["sh", "-c", editor + ' "$@"', editor, str(path)], env=git.env)
+    if result.returncode:
+        raise RewordError(f"editor failed ({result.returncode})")
+    message = path.read_bytes()
+    if message == original or not message.strip():
+        return None
+    if b"\0" in message:
+        raise RewordError("commit messages cannot contain NUL bytes")
+    message = cleanup_message(git, message)
+    if message == original or not message.strip():
+        return None
+    return message
+
+
+def identity_env(raw, prefix):
+    match = re.fullmatch(rb"(.*) <([^<>]*)> (-?\d+ [+-]\d{4})", raw)
+    if not match:
+        raise RewordError("cannot pass this identity to Git's signer")
+    return {f"GIT_{prefix}_{key}": os.fsdecode(value)
+            for key, value in zip(("NAME", "EMAIL", "DATE"), match.groups())}
+
+
+def write_commit(git, raw, sign):
+    if not sign:
+        return git.read("hash-object", "-t", "commit", "-w", "--stdin",
+                        data=raw, write=True).strip()
+    commit = Commit(raw)
+    encodings = commit.values(b"encoding")
+    if len(encodings) > 1 or any(b"\n" in e for e in encodings):
+        raise RewordError("cannot sign a commit with malformed encoding headers")
+    encoding = os.fsdecode(encodings[0]) if encodings else "UTF-8"
+    env = dict(git.env, **identity_env(commit.one(b"author"), "AUTHOR"),
+               **identity_env(commit.one(b"committer"), "COMMITTER"))
+    args = ["-c", "i18n.commitEncoding=" + encoding, "commit-tree", "-S"]
+    for parent in commit.values(b"parent"):
+        args.extend(("-p", parent.decode()))
+    args.append(commit.one(b"tree").decode())
+    oid = git.read(*args, data=commit.message, env=env, write=True).strip()
+    signed = Commit(git.read("cat-file", "commit", oid.decode()))
+    # commit-tree may normalize messages or omit extension headers. Never publish
+    # its result unless removing the generated signature yields our exact plan.
+    if signed.unsigned() != raw or not any(signed.signature(h) for h in signed.headers):
+        raise RewordError("Git's signer could not preserve the commit bytes/headers; "
+                          "no ref updated. To explicitly allow unsigned output, use "
+                          "git -c commit.gpgSign=false reword -f <commit-ish>")
+    return oid
+
+
+def snapshot_notes(git):
+    """Include every local notes namespace, even ones not displayed by git log."""
+    active = git.read("notes", "get-ref").strip()
+    if not active.startswith(b"refs/notes/"):
+        raise RewordError("notes refs outside refs/notes/ are unsupported")
+    refs = {}
+    for line in git.read("for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)",
+                         "refs/notes/").splitlines():
+        name, oid, symbolic = line.split(b"\0")
+        if symbolic:
+            raise RewordError(f"symbolic notes ref is unsupported: {display(name)}")
+        refs[os.fsdecode(name)] = oid
+    return refs
+
+
+def copy_notes(git, refs, mapping, directory):
+    if not refs:
+        return {}
+    # Let Git handle notes trees and fanout. A private bare repository shares
+    # only the object store: its temporary refs never appear in the real repo.
+    # Copy every namespace regardless of notes.rewrite.* settings, retaining
+    # original notes and reusing their blobs (including binary and empty notes).
+    # Notes-history commits use the current identity/date, unlike rewritten commits.
+    env = dict(git.env)
+    for key in ("GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE"):
+        env.pop(key, None)
+    env.update(GIT_DIR=str(Path(directory) / "notes.git"),
+               GIT_OBJECT_DIRECTORY=str(git.path("objects")))
+    ident = git.read("var", "GIT_COMMITTER_IDENT").rstrip(b"\n")
+    env.update(identity_env(ident, "AUTHOR"))
+    env.update(identity_env(ident, "COMMITTER"))
+    options = ("-c", "core.hooksPath=" + os.devnull)
+    git.read(*options, "init", "--bare", "--quiet", "--template=",
+             "--object-format=" + git.read("rev-parse", "--show-object-format").strip().decode(),
+             env=env)
+    updated = {}
+    for ref, old in refs.items():
+        git.read(*options, "update-ref", "refs/notes/staging", old.decode(), env=env)
+        entries = git.read(*options, "notes", "--ref=refs/notes/staging", "list", env=env)
+        notes = {annotated: note for note, annotated in (line.split() for line in entries.splitlines())}
+        copies = []
+        for source, destination in mapping.items():
+            if source not in notes or source == destination:
+                continue
+            if destination in notes:
+                if notes[source] != notes[destination]:
+                    raise RewordError(f"different notes already exist on {destination.decode()} in {ref}")
+                continue
+            copies.append(source + b" " + destination + b"\n")
+        if copies:
+            git.read(*options, "notes", "--ref=refs/notes/staging", "copy", "--stdin",
+                     data=b"".join(copies), env=env, write=True)
+            updated[ref] = git.read("rev-parse", "refs/notes/staging", env=env).strip()
+    return updated
+
+
+def publish(git, branch, old, new, target, notes_before, notes_after):
+    """Lock and verify both HEAD's identity and the original branch's value."""
+    # Publish HEAD and notes together. Earlier failures can leave unreferenced
+    # objects, but no real refs have moved; after sending commit, an unconfirmed
+    # result must not be reported as a rollback.
+    # Updating through HEAD locks both HEAD and its referent (if any). Inspect
+    # the identity after prepare, while those locks prevent a branch switch.
+    # A separate symref-verify HEAD conflicts with Git's implicit HEAD update.
+    commands = ["start", f"update HEAD {new.decode()} {old.decode()}"]
+    for ref, previous in notes_before.items():
+        commands.append("option no-deref")
+        if ref in notes_after:
+            commands.append(f"update {ref} {notes_after[ref].decode()} {previous.decode()}")
+        else:
+            commands.append(f"verify {ref} {previous.decode()}")
+    commands.append("prepare")
+    args = ["git", "update-ref", "--create-reflog", "-m",
+            "reword " + target.decode()[:12], "--stdin"]
+    trace(args)
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=errors, env=git.env)
+        try:
+            process.stdin.write(("\n".join(commands) + "\n").encode())
+            process.stdin.flush()
+            for expected in (b"start: ok\n", b"prepare: ok\n"):
+                if process.stdout.readline() != expected:
+                    process.stdin.close()
+                    process.wait()
+                    errors.seek(0)
+                    raise RewordError("ref transaction refused; HEAD, branch, or notes may have changed:\n"
+                                      + display(errors.read()).strip())
+            # An OID comparison alone cannot detect switching to another branch
+            # at the same tip, or switching between attached and detached HEAD.
+            if git.symbolic("HEAD") != branch or (branch and git.symbolic(branch) is not None):
+                raise RewordError("HEAD/branch identity changed while rewording; no ref updated")
+            if snapshot_notes(git) != notes_before:
+                raise RewordError("notes changed while rewording; no ref updated")
+            check_repository(git)
+            process.stdin.write(b"commit\n")
+            process.stdin.flush()
+            response = process.stdout.readline()
+            process.stdin.close()
+            status = process.wait()
+            errors.seek(0)
+            detail = display(errors.read()).strip()
+            if status or response != b"commit: ok\n":
+                raise RewordError("ref transaction did not confirm completion; inspect the reflog "
+                                  "before retrying" + (":\n" + detail if detail else ""))
+            if detail:
+                print(detail, file=sys.stderr)
+        finally:
+            if not process.stdin.closed:
+                process.stdin.close()  # EOF aborts an uncommitted transaction.
+            process.wait()
+            process.stdout.close()
+
+
+def main():
+    parser = ArgumentParser(description=__doc__, add_help=False,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-h", "--help", action="help", help=argparse.SUPPRESS)
+    parser.add_argument("-f", "--force", action="store_true", help="accept warnings (never bypass safety checks)")
+    parser.add_argument("commit", metavar="<commit-ish>",
+                        help="Git revision resolving to a commit reachable from HEAD")
+    args = parser.parse_args()
+    git = Git()
+    version = re.search(rb"\b(\d+)\.(\d+)", git.read("--version"))
+    if not version or tuple(map(int, version.groups())) < (2, 46):
+        raise RewordError("Git 2.46+ is required")
+    # Work from the root so relative core.hooksPath works even from a subdirectory.
+    root = git.read("rev-parse", "--show-toplevel").rstrip(b"\n")
+    os.chdir(os.fsdecode(root))
+    check_repository(git)
+    branch = git.symbolic("HEAD")
+    if branch and (not branch.startswith("refs/heads/") or git.symbolic(branch) is not None):
+        raise RewordError("HEAD must be detached or point directly to a local branch")
+    old = git.read("rev-parse", "--verify", "HEAD^{commit}").strip()
+    if branch and git.read("rev-parse", "--verify", branch).strip() != old:
+        raise RewordError("HEAD changed while taking the snapshot")
+    # Resolve the expression before peeling: appending ^{commit} directly
+    # would become part of the search pattern in expressions such as :/fix.
+    revision = git.read("rev-parse", "--verify", "--end-of-options", args.commit).strip()
+    target = git.read("rev-parse", "--verify", revision.decode() + "^{commit}").strip()
+    if git.symbolic("HEAD") != branch or git.read("rev-parse", "HEAD").strip() != old:
+        raise RewordError("HEAD changed while resolving the target")
+    ancestor = git.run("merge-base", "--is-ancestor", target.decode(), old.decode(), allowed=(0, 1))
+    if ancestor.returncode:
+        raise RewordError("target is not an ancestor of the original HEAD")
+    descendants = git.read("rev-list", "--reverse", "--topo-order", "--ancestry-path",
+                           target.decode() + ".." + old.decode()).splitlines()
+    order = [target, *descendants]
+    if order[-1] != old or len(set(order)) != len(order):
+        raise RewordError("incomplete or invalid rewrite range")
+    commits = {oid: Commit(git.read("cat-file", "commit", oid.decode())) for oid in order}
+    seen = set()
+    for oid, commit in commits.items():
+        if any(p in commits and p not in seen for p in commit.values(b"parent")):
+            raise RewordError("rewrite range is not in parent-first order")
+        for tag in commit.values(b"mergetag"):
+            if tag.split(b"\n", 1)[0].partition(b"object ")[2] in commits:
+                raise RewordError("rewriting this range would invalidate a mergetag; no ref updated")
+        seen.add(oid)
+    sign = git.config("commit.gpgSign", boolean=True) == b"true"
+    confirm(git, target, commits, sign, args.force)
+    notes_before = snapshot_notes(git)
+    # Keep the original private file on failure: copying it during an I/O error
+    # could fail too, and cleanup must not discard the user's edit in that case.
+    directory = tempfile.mkdtemp(prefix="reword-", dir=git.path("."))
+    keep_edit = False
+    try:
+        message = edit_message(git, target, commits[target].message, directory)
+        if message is None:
+            print("Message unchanged or empty; no commits rewritten.")
+            return
+        mapping = {}
+        for oid, commit in commits.items():
+            raw = commit.rewrite(mapping, message if oid == target else commit.message)
+            mapping[oid] = write_commit(git, raw, sign)
+        notes_after = copy_notes(git, notes_before, mapping, directory)
+        publish(git, branch, old, mapping[old], target, notes_before, notes_after)
+    except (RewordError, OSError, KeyboardInterrupt):
+        keep_edit = True
+        print(f"Edit directory retained at {directory}", file=sys.stderr)
+        raise
+    finally:
+        if not keep_edit:
+            try:
+                shutil.rmtree(directory)
+            except OSError as error:
+                # Cleanup failure must not hide a successfully published result.
+                print(f"warning: could not remove {directory}: {error}", file=sys.stderr)
+    print(f"Rewrote {len(commits)} commit(s). Previous tip: {old.decode()}")
+    if branch:
+        print("Undo (only while that branch still has this result):\n  " + shlex.join([
+            "git", "update-ref", "--no-deref", "-m", "reword: undo", branch,
+            old.decode(), mapping[old].decode()]))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RewordError, OSError) as error:
+        print(f"git-reword: {error}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("git-reword: interrupted; inspect the reflog if publication had started", file=sys.stderr)
+        sys.exit(130)
