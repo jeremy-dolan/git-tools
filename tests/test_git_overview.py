@@ -303,6 +303,27 @@ print(json.dumps(prs))
         for i in range(13):
             self.assertIn(f"topic{i:02}", branches)
 
+    def test_missing_branch_limit_is_rejected(self):
+        result = self.run_overview("-n", cwd=self.base, ok=False,
+                                   env={"GIT_OVERVIEW_BRANCH_LIMIT": "3"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"git-overview: -n requires a branch limit", result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertFalse(self.calls.exists())
+
+    def test_invalid_branch_limits_are_rejected(self):
+        cases = (("-n", "-1"), ("-n", ""), ("-n", "abc"), ("-n", "1.5"),
+                 ("-n", "--offline"))
+        for args, env in [(args, {}) for args in cases] + [
+                ((), {"GIT_OVERVIEW_BRANCH_LIMIT": "-1"})]:
+            with self.subTest(args=args, env=env):
+                result = self.run_overview(*args, env=env, cwd=self.base, ok=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b"invalid branch limit", result.stderr)
+                self.assertIn(b"want a nonnegative integer", result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertFalse(self.calls.exists())
+
     def test_pipe_in_branch_name_preserves_fields(self):
         self.git("branch", "topic|pipe")
         branches = self.section(self.output("--offline"), "BRANCHES")

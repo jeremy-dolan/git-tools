@@ -54,7 +54,9 @@ def parse_options(args):
         elif arg == "--all-branches":
             limit = "0"
         elif arg == "-n":
-            limit = next(args, "12") or "12"
+            limit = next(args, None)
+            if limit is None:
+                raise ValueError("-n requires a branch limit")
         elif arg == "--color":
             options.color = "always"
         elif arg == "--no-color":
@@ -72,7 +74,9 @@ def parse_options(args):
     try:
         options.branch_limit = int(limit)
     except ValueError:
-        raise ValueError("invalid branch limit " + limit + " (want an integer)")
+        raise ValueError("invalid branch limit " + limit + " (want a nonnegative integer)")
+    if options.branch_limit < 0:
+        raise ValueError("invalid branch limit " + limit + " (want a nonnegative integer)")
     return options
 
 
