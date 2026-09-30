@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "git-reword"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "git-reword"
 REAL_GIT = shutil.which("git")
 EDIT = 'printf "reworded\\n" > "$1"'
 

@@ -18,7 +18,7 @@ import time
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "git-overview"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "git-overview"
 REAL_GIT = shutil.which("git")
 # Relative ages avoid depending on whether the implementation uses date(1) or
 # an in-process clock. Fixtures stay well away from the asserted age boundaries.
