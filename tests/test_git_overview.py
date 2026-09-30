@@ -330,6 +330,21 @@ print(json.dumps(prs))
         self.assertRegex(self.section(linked_output, "BRANCHES"), r"(?m)^\* linked\s")
         self.assertRegex(self.section(linked_output, "WORKTREES"), r"(?m)^\* .*linked worktree\s")
 
+    def test_worktree_home_shortening_respects_directory_boundaries(self):
+        linked = self.base / "repository" / "repo"
+        self.git("worktree", "add", "-qb", "linked", str(linked))
+        cases = (
+            (str(self.repo), "~", str(linked)),
+            (str(self.base), "~/repo", "~/repository/repo"),
+            ("", str(self.repo), str(linked)),
+        )
+        for home, repo_path, linked_path in cases:
+            with self.subTest(home=home):
+                section = self.section(self.output("--offline", env={
+                    "HOME": home, "COLUMNS": "200"}), "WORKTREES")
+                self.assertRegex(section, r"(?m)^\* " + re.escape(repo_path) + r"\s")
+                self.assertRegex(section, r"(?m)^  " + re.escape(linked_path) + r"\s")
+
     def test_missing_worktree_is_reported(self):
         linked = self.base / "missing"
         self.git("worktree", "add", "-qb", "missing", str(linked))

@@ -625,7 +625,8 @@ class Renderer:
             print("  " + self.c("(just this one)", "dim"))
             return
         home = os.environ.get("HOME", "")
-        paths = [visible("~" + tree.path[len(home):] if home and tree.path.startswith(home)
+        paths = [visible("~" + tree.path[len(home):] if home and
+                         (tree.path == home or tree.path.startswith(home + os.sep))
                          else tree.path) for tree in trees]
         shaw = max(3, *(len(tree.sha) for tree in trees))
         refw = min(21, max(6, *(len(visible(tree.ref)) for tree in trees)))
