@@ -1,7 +1,12 @@
 # git-tools
 
-Two Git utilities:
- * git-overview, a one-screen repository overview
- * git-reword, commit message editing that doesn't touch the work tree
+Some Git utilities. Installs with `install-git-tools` from my
+[`.zshrc`](https://github.com/jeremy-dolan/dotfiles). See also
+[terminal-tools](https://github.com/jeremy-dolan/terminal-tools).
 
-When placed in $PATH, you can run them as git subcommands: `git overview` and `git reword`
+ * `git-overview`: a one-screen bird's-eye view of local git state; strictly read-only
+ * `git-reword`: reword a commit message directly without touching the work tree
+
+If placed in $PATH, these can run as git subcommands: `git overview`, `git reword`:
+
+![Demo of git-overview](assets/git-overview.gif)

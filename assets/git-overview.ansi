@@ -1,0 +1,49 @@
+
+[1m[36m HEAD ────────────────────────────────────────────────────────────────────────[0m
+  [31m[1m⚑ MERGE in progress[0m
+  [2mbranch   [0m [1mfeat/raptor-doors[0m
+  [2mcommit   [0m [33mf6652a0[0m  Alert when a raptor opens a door  [2m(15m ago)[0m
+  [2mupstream [0m origin/feat/raptor-doors  [33m↑2 ahead[0m  [33m↓3 behind[0m  [2m(checked just now)[0m
+
+[1m[36m UNCOMMITTED ─────────────────────────────────────────────────────────────────[0m
+  [31m[1m1 conflict[0m   3 staged   [33m2 modified[0m   [2m2 untracked[0m
+    [31mUU security/doors.py[0m
+
+[1m[36m BRANCHES ────────────────────────────────────────────────────────────────────[0m
+  [2mBRANCH              SYNC   COMMIT  SHA     SUBJECT[0m
+[32m[1m*[0m feat/raptor-doors   [33m↑2 ↓3 [0m [2m15m ago[0m [33mf6652a0[0m [2mAlert when a raptor opens a door[0m
+[36m+[0m feat/storm-tracker  [32m✓     [0m [2m11h ago[0m [33m5b08d40[0m [2mAdd tropical storm to opening-day …[0m
+[36m+[0m feat/jeep-tour      [33m↑1    [0m [2m11h ago[0m [33m271da5c[0m [2mRemind guests to stay in the vehic…[0m
+  fix/tour-audio      [33m⚠ gone[0m [2m1d ago [0m [33mbd92211[0m [2mRestore narration in tour vehicles[0m
+  main                [32m✓     [0m [2m2d ago [0m [33m4fbebfd[0m [2mVerify backup power before opening…[0m
+
+[1m[36m WORKTREES ───────────────────────────────────────────────────────────────────[0m
+  [2mWORKTREE                 BRANCH              STATUS[0m
+[32m[1m*[0m /prod/jurassic-park      [36mfeat/raptor-doors [0m  [31m[1m1 conflict[0m [33m5 changed [0;2m2 untracked[0m[0m
+  /dev/worktrees/weather   [0;33m62a5dce [0;2m(detached)[0m  [32mclean[0m
+  /dev/worktrees/tour      [36mfix/tour-audio    [0m  [33m1 changed[0m [2m1 untracked[0m
+
+[1m[36m STASHES ─────────────────────────────────────────────────────────────────────[0m
+  stash@{0}  [2m1993-05-28 12d  [0m  On main: budget cuts, probably fine
+
+[1m[36m TAGS ────────────────────────────────────────────────────────────────────────[0m
+  v1.0.0-opening-day             [2m1993-06-09 1d ago[0m
+  v0.9.0                         [2m1993-06-01 8d ago[0m
+
+[1m[36m OPEN PRS ────────────────────────────────────────────────────────────────────[0m
+  [33m#3[0m  ready[0m  [31m✗ failing[0m  [34mfeat/storm-tracker[0m  Track opening-day storms
+  [33m#2[0m  ready[0m  [32m✓ passing[0m  [34mfeat/jeep-tour    [0m  Vehicle movement attracts T. rex
+  [33m#1[0m  [2mdraft[0m  [33m… pending[0m  [34mfeat/raptor-doors [0m  Detect raptors opening doors
+
+[1m[36m ISSUES ──────────────────────────────────────────────────────────────────────[0m
+  2 open, latest: #5 Backup power depends on one employee[2m (1h ago)[0m
+
+[1m[36m RECENT (reflog) ─────────────────────────────────────────────────────────────[0m
+  [33mf6652a0 [0m [2m15m ago [0m commit: Alert when a raptor opens a door
+  [33m5525d32 [0m [2m48m ago [0m commit: Display door alarms in the control room
+  [33md214bb7 [0m [2m1h ago  [0m commit: Raise door sensors above handle height
+  [33m198c550 [0m [2m2h ago  [0m checkout: moving from main to feat/raptor-doors
+  [33m44a3f55 [0m [2m2h ago  [0m merge chore/budget: Merge made by the 'ort' strategy.
+  [33m4fbebfd [0m [2m2h ago  [0m checkout: moving from chore/budget to main
+  [33m294099c [0m [2m2h ago  [0m commit: Reduce the overnight engineering shift
+
