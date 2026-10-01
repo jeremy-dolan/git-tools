@@ -578,7 +578,7 @@ class Renderer:
                 behind, ahead = head.counts
                 pieces = [(f"↑{ahead} ahead", "yellow")] if ahead else []
                 if behind:
-                    pieces.append((f"↓{behind} behind", "magenta"))
+                    pieces.append((f"↓{behind} behind", "yellow"))
                 sync = "  ".join(text for text, _ in pieces)
                 colored = "  ".join(self.c(text, color) for text, color in pieces)
             plain = visible(head.upstream) + "   " + sync
@@ -596,7 +596,7 @@ class Renderer:
                                else "remote has commits you have never fetched — counts stale")
                     color = "yellow"
                 note_plain = "⚠ " + message
-                note = self.c("⚠", color, "bold") + self.c(" " + message, color)
+                note = self.c(note_plain, color)
             else:
                 elapsed = self.now - head.fetch_ts if fetched else 0
                 color = ("yellow",) if not fetched or elapsed > 86400 else ("dim",)
@@ -681,7 +681,7 @@ class Renderer:
                 tail = self.c("→" + clip(avail - 1, upstream, tail=True), "cyan")
             else:
                 tail = self.c(clip(avail, subject), "dim")
-            print(mark + " " + self.c(clip(namew, visible(row.name), tail=True).ljust(namew), "bold")
+            print(mark + " " + clip(namew, visible(row.name), tail=True).ljust(namew)
                   + "  " + self.c(row.sync.ljust(syncw), row.color)
                   + " " + self.c(when.ljust(whenw), "dim")
                   + " " + self.c(row.sha.ljust(shaw), "yellow") + " " + tail)
@@ -716,7 +716,7 @@ class Renderer:
             mark = self.c("*", "green", "bold") if tree.path == toplevel else " "
             marks = ("   " + self.c("[locked]", "yellow") if tree.locked else "")
             marks += "   " + self.c("[prunable]", "red") if tree.prunable else ""
-            print(mark + " " + self.c(clip(pathw, path, tail=True).ljust(pathw), "bold")
+            print(mark + " " + clip(pathw, path, tail=True).ljust(pathw)
                   + "  " + self.c((tree.sha or "—").ljust(shaw), "yellow")
                   + "  " + self.c(clip(refw, visible(tree.ref), tail=True).ljust(refw), "cyan")
                   + "  " + status + marks)
@@ -731,7 +731,7 @@ class Renderer:
             for ref, timestamp, message in rows:
                 color = "red" if self.now - int(timestamp) > 604800 else "dim"
                 when = calendar(timestamp) + " " + age(timestamp, self.now).ljust(5)
-                print("  " + self.c(ref.ljust(10), "magenta") + " " + self.c(when, color)
+                print("  " + ref.ljust(10) + " " + self.c(when, color)
                       + "  " + clip(self.cols - 34, visible(message)))
 
     def tags(self, rows, total):
@@ -746,7 +746,7 @@ class Renderer:
                 # has no creator date. The tag exists even without an age.
                 when = (calendar(timestamp) + " " + age(timestamp, self.now) + " ago"
                         if timestamp else "—")
-                print("  " + self.c(clip(30, visible(name)).ljust(30), "bold") + " "
+                print("  " + clip(30, visible(name)).ljust(30) + " "
                       + self.c(when, "dim"))
             if total > 5:
                 print("  " + self.c(f"… {total - 5} more", "dim"))
