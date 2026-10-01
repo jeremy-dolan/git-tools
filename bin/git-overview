@@ -3,17 +3,17 @@
 
 Strictly read-only: never fetches, writes refs, or refreshes the index.
 Remote advertisements confirm whether locally computed counts are current.
-Requires Python 3.8+ and Git; GitHub CLI (gh) is optional.
+Requires Python 3.8+ and Git; authenticated GitHub CLI (gh) is optional.
 
-Usage: git-overview [--no-pr] [--offline] [-n N | --all-branches]
+Usage: git-overview [--no-check-remote] [--no-github] [-n N | --all-branches]
                     [--color[=WHEN]] [--no-color] [--help]
 
-  --no-pr           skip the GitHub PR lookup
-  --offline         make no network calls at all (implies --no-pr)
-  -n N              show at most N branches (default = 12, 0 for no limit)
-  --all-branches    same as -n 0
-  --color[=WHEN]    always, never, or auto (default auto; bare --color = always)
-  --no-color        same as --color=never
+ --no-check-remote  skip the upstream freshness check
+ --no-github        skip the GitHub PR and issue lookup
+ -n N               show at most N branches (default = 12, 0 for no limit)
+ --all-branches     same as -n 0
+ --color[=WHEN]     always, never, or auto (default auto; bare --color = always)
+ --no-color         same as --color=never
 
 The branch cap defaults to 12, or $GIT_OVERVIEW_BRANCH_LIMIT if set. Branches
 are ordered most-recently-committed first; the checked-out branch is always
@@ -35,8 +35,8 @@ import time
 
 @dataclass
 class Options:
-    network: bool = True
-    pr_skipped: str = ""
+    check_remote: bool = True
+    github_skipped: str = ""
     branch_limit: int = 12
     color: str = "auto"
 
@@ -46,11 +46,10 @@ def parse_options(args):
     limit = os.environ.get("GIT_OVERVIEW_BRANCH_LIMIT") or "12"
     args = iter(args)
     for arg in args:
-        if arg == "--no-pr":
-            options.pr_skipped = arg
-        elif arg == "--offline":
-            options.network = False
-            options.pr_skipped = arg
+        if arg == "--no-github":
+            options.github_skipped = arg
+        elif arg == "--no-check-remote":
+            options.check_remote = False
         elif arg == "--all-branches":
             limit = "0"
         elif arg == "-n":
@@ -332,7 +331,7 @@ def collect_head(git, options):
                 head.counts = behind, ahead
             except ValueError:
                 pass
-    if options.network and head.remote and head.merge:
+    if options.check_remote and head.remote and head.merge:
         have = git.text("rev-parse", "--verify", "--quiet", "refs/remotes/" + head.upstream) if head.upstream else ""
         # ls-remote reads advertised refs without downloading objects, moving
         # refs, or writing FETCH_HEAD. fetch --dry-run can still download
@@ -360,42 +359,100 @@ def collect_head(git, options):
     return head
 
 
+GITHUB_QUERY = """
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: 15, states: OPEN,
+      orderBy: {field: CREATED_AT, direction: DESC}) {
+      nodes {
+        number title headRefName isDraft reviewDecision
+        commits(last: 1) {
+          nodes { commit { statusCheckRollup { state } } }
+        }
+      }
+    }
+    issues(first: 1, states: OPEN,
+      orderBy: {field: CREATED_AT, direction: DESC}) {
+      totalCount
+      nodes { number title createdAt }
+    }
+  }
+}
+"""
+
+
 @dataclass
-class PullRequests:
+class GitHubOverview:
     state: str
-    rows: list = field(default_factory=list)
+    prs: list = field(default_factory=list)
+    issue_count: int = 0
+    newest_issue: dict = None
 
 
-def collect_prs(options, has_remote):
-    if options.pr_skipped:
-        return PullRequests("skipped: " + options.pr_skipped)
+def parse_github(data):
+    # Keep the GraphQL envelope: partial data accompanied by errors must not
+    # turn failed lookups into "no checks", "(none)", or "0 open".
+    payload = json.loads(data)
+    if not isinstance(payload, dict) or payload.get("errors"):
+        raise ValueError("invalid GitHub data")
+    repository = payload["data"]["repository"]
+    rows = repository["pullRequests"]["nodes"]
+    if not isinstance(rows, list):
+        raise ValueError("invalid PR data")
+    prs = []
+    for row in rows:
+        if (not isinstance(row, dict)
+                or type(row.get("number")) is not int or row["number"] <= 0
+                or type(row.get("isDraft")) is not bool
+                or any(not isinstance(row.get(key), str) for key in ("title", "headRefName"))
+                or "reviewDecision" not in row
+                or (row["reviewDecision"] is not None and not isinstance(row["reviewDecision"], str))):
+            raise ValueError("invalid PR data")
+        commits = row["commits"]["nodes"]
+        if not isinstance(commits, list) or len(commits) != 1:
+            raise ValueError("invalid PR commit data")
+        rollup = commits[0]["commit"]["statusCheckRollup"]
+        ci = None if rollup is None else rollup["state"]
+        if rollup is not None and not isinstance(ci, str):
+            raise ValueError("invalid CI data")
+        prs.append(dict(row, ci=ci))
+    issues = repository["issues"]
+    count, nodes = issues["totalCount"], issues["nodes"]
+    if (type(count) is not int or count < 0 or not isinstance(nodes, list)
+            or len(nodes) != min(count, 1)):
+        raise ValueError("invalid issue data")
+    newest = None
+    if nodes:
+        issue = nodes[0]
+        if (not isinstance(issue, dict) or type(issue.get("number")) is not int
+                or issue["number"] <= 0 or not isinstance(issue.get("title"), str)
+                or not isinstance(issue.get("createdAt"), str)):
+            raise ValueError("invalid issue data")
+        created = datetime.fromisoformat(issue["createdAt"].replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            raise ValueError("issue creation date has no timezone")
+        newest = dict(issue, timestamp=int(created.timestamp()))
+    return GitHubOverview("", prs, count, newest)
+
+
+def collect_github(options, has_remote):
+    if options.github_skipped:
+        return GitHubOverview("skipped: " + options.github_skipped)
     if not shutil.which("gh"):
-        return PullRequests("not checked: gh not installed")
+        return GitHubOverview("not checked: gh not installed")
     if not has_remote:
-        return PullRequests("not checked: no remote configured")
-    result = run(["gh", "pr", "list", "--limit", "15", "--json",
-                  "number,title,headRefName,isDraft,reviewDecision"],
+        return GitHubOverview("not checked: no remote configured")
+    result = run(["gh", "api", "graphql", "-F", "owner={owner}", "-F", "name={repo}",
+                  "-f", "query=" + GITHUB_QUERY],
                  env=network_env(), timeout=6)
     if result.timed_out:
-        return PullRequests("not checked: gh timed out after 6s")
+        return GitHubOverview("not checked: gh timed out after 6s")
     if result.ok:
         try:
-            rows = json.loads(result.data)
-            if not isinstance(rows, list) or any(
-                not isinstance(row, dict)
-                or type(row.get("number")) is not int
-                or type(row.get("isDraft")) is not bool
-                or any(not isinstance(row.get(key), str) for key in
-                       ("title", "headRefName"))
-                or "reviewDecision" not in row
-                or (row["reviewDecision"] is not None and not isinstance(row["reviewDecision"], str))
-                for row in rows
-            ):
-                raise ValueError("invalid PR data")
-            return PullRequests("", rows)
-        except (ValueError, UnicodeError):
+            return parse_github(result.data)
+        except (ValueError, UnicodeError, KeyError, TypeError, OverflowError, OSError):
             pass
-    return PullRequests("not checked: gh failed — not authenticated, or no GitHub remote")
+    return GitHubOverview("not checked: gh failed — invalid response, not authenticated, or no GitHub remote")
 
 
 @dataclass
@@ -694,24 +751,54 @@ class Renderer:
             if total > 5:
                 print("  " + self.c(f"… {total - 5} more", "dim"))
 
-    def prs(self, prs):
+    def github_unavailable(self, state):
+        color = "yellow" if "gh failed" in state or "timed out" in state else "dim"
+        print("  " + self.c("(" + state + ")", color))
+
+    def prs(self, github):
         self.section("OPEN PRS")
-        if prs.state:
-            color = "yellow" if "gh failed" in prs.state or "timed out" in prs.state else "dim"
-            print("  " + self.c("(" + prs.state + ")", color))
-        elif not prs.rows:
+        if github.state:
+            self.github_unavailable(github.state)
+        elif not github.prs:
             self.none()
         else:
-            for pr in prs.rows:
+            numberw = max(6, *(len(str(pr["number"])) + 1 for pr in github.prs))
+            branchw = min(24, max(8, self.cols - numberw - 12 - 12 - 20))
+            titlew = self.cols - numberw - 12 - 12 - branchw - 7
+            for pr in github.prs:
                 flag, colors = ("draft", ("dim",)) if pr["isDraft"] else ("ready", ())
                 if pr["reviewDecision"] == "CHANGES_REQUESTED":
                     flag, colors = "changes req", ("red",)
                 elif pr["reviewDecision"] == "APPROVED":
                     flag, colors = "approved", ("green", "bold")
-                print("  " + self.c("#" + str(pr["number"]).ljust(5), "yellow") + " "
+                ci, ci_color = {
+                    "SUCCESS": ("✓ passing", "green"),
+                    "FAILURE": ("✗ failing", "red"),
+                    "ERROR": ("✗ error", "red"),
+                    "PENDING": ("… pending", "yellow"),
+                    "EXPECTED": ("… pending", "yellow"),
+                    None: ("— no checks", "dim"),
+                }.get(pr["ci"], ("? unknown", "yellow"))
+                print("  " + self.c(("#" + str(pr["number"])).ljust(numberw), "yellow") + " "
                       + self.c(flag.ljust(12), *colors) + " "
-                      + self.c(clip(24, visible(pr["headRefName"])).ljust(24), "blue")
-                      + "  " + clip(self.cols - 54, visible(pr["title"])))
+                      + self.c(ci.ljust(12), ci_color) + " "
+                      + self.c(clip(branchw, visible(pr["headRefName"])).ljust(branchw), "blue")
+                      + "  " + clip(titlew, visible(pr["title"])))
+
+    def issues(self, github):
+        self.section("ISSUES")
+        if github.state:
+            self.github_unavailable(github.state)
+            return
+        prefix = "  " + str(github.issue_count) + " open"
+        issue = github.newest_issue
+        if issue is None:
+            print(prefix)
+            return
+        prefix += "   newest: #" + str(issue["number"]) + " "
+        when = " (" + age(issue["timestamp"], self.now) + " ago)"
+        print(prefix + clip(self.cols - len(prefix) - len(when), visible(issue["title"]))
+              + self.c(when, "dim"))
 
     def reflog(self, rows):
         self.section("RECENT (reflog)")
@@ -749,7 +836,7 @@ def main():
     tags = records(git.run("for-each-ref", "--sort=-creatordate", "--count=5", "refs/tags",
                           "--format=%(refname:short)%00%(creatordate:unix)%00%(objectname:short)%00"), 3, ref_format=True)
     total_tags = len(git.run("for-each-ref", "refs/tags", "--format=x").data.splitlines())
-    prs = collect_prs(options, head.has_remote)
+    github = collect_github(options, head.has_remote)
     reflog = records(git.run("reflog", "-n", "6", "-z", "--date=unix", "--format=%h%x00%gd%x00%gs"), 3)
     toplevel = git.text("rev-parse", "--show-toplevel")
     renderer = Renderer(options)
@@ -759,7 +846,8 @@ def main():
     renderer.worktrees(trees, toplevel)
     renderer.stashes(stashes)
     renderer.tags(tags, total_tags)
-    renderer.prs(prs)
+    renderer.prs(github)
+    renderer.issues(github)
     renderer.reflog(reflog)
     print()
     return 0

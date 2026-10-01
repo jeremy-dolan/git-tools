@@ -6,6 +6,7 @@ Command shims control remote answers and query failures; COLUMNS controls width.
 """
 
 import json
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
@@ -24,7 +25,7 @@ REAL_GIT = shutil.which("git")
 # an in-process clock. Fixtures stay well away from the asserted age boundaries.
 NOW = int(time.time())
 SECTIONS = ("HEAD", "UNCOMMITTED", "BRANCHES", "WORKTREES", "STASHES",
-            "TAGS", "OPEN PRS", "RECENT (reflog)")
+            "TAGS", "OPEN PRS", "ISSUES", "RECENT (reflog)")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -161,8 +162,17 @@ os.execv({REAL_GIT!r}, [{REAL_GIT!r}, *args])
         fetch_head.write_text(f"{self.root}\t\tbranch 'main' of origin\n")
         os.utime(fetch_head, (NOW - 172860, NOW - 172860))
 
-    def gh(self, prs=(), rc=0):
-        self.env["OVERVIEW_TEST_PRS"] = json.dumps(prs)
+    def github_response(self, prs=(), issue_count=0, newest_issue=None):
+        rows = [dict(pr, commits=pr.get("commits", {
+            "nodes": [{"commit": {"statusCheckRollup": None}}]})) for pr in prs]
+        return {"data": {"repository": {
+            "pullRequests": {"nodes": rows},
+            "issues": {"totalCount": issue_count,
+                       "nodes": [] if newest_issue is None else [newest_issue]}}}}
+
+    def gh(self, prs=(), rc=0, issue_count=0, newest_issue=None):
+        self.env["OVERVIEW_TEST_GITHUB"] = json.dumps(
+            self.github_response(prs, issue_count, newest_issue))
         self.env["OVERVIEW_TEST_GH_RC"] = str(rc)
         self.shim("gh", """
 record('gh', sys.argv[1:])
@@ -176,8 +186,7 @@ if 'OVERVIEW_TEST_GH_RAW' in os.environ:
     sys.exit(0)
 if int(os.environ['OVERVIEW_TEST_GH_RC']):
     sys.exit(int(os.environ['OVERVIEW_TEST_GH_RC']))
-prs = json.loads(os.environ['OVERVIEW_TEST_PRS'])
-print(json.dumps(prs))
+print(os.environ['OVERVIEW_TEST_GITHUB'])
 """)
 
     def snapshot(self, root):
@@ -196,7 +205,7 @@ print(json.dumps(prs))
         return result
 
     def test_clean_repository_sections_and_head(self):
-        output = self.output("--offline")
+        output = self.output("--no-check-remote", "--no-github")
         positions = [output.index(name + " ─") for name in SECTIONS]
         self.assertEqual(positions, sorted(positions))
         head = self.section(output, "HEAD")
@@ -212,7 +221,7 @@ print(json.dumps(prs))
     def test_unborn_repository(self):
         empty = self.base / "empty"
         self.git("init", "-q", "-b", "new", str(empty))
-        output = self.output("--offline", cwd=empty)
+        output = self.output("--no-check-remote", "--no-github", cwd=empty)
         self.assertIn("no commits yet", self.section(output, "HEAD"))
         self.assertIn("new", self.section(output, "HEAD"))
         self.assertIn("(none)", self.section(output, "BRANCHES"))
@@ -220,7 +229,7 @@ print(json.dumps(prs))
 
     def test_detached_head(self):
         self.git("checkout", "-q", "--detach")
-        head = self.section(self.output("--offline"), "HEAD")
+        head = self.section(self.output("--no-check-remote", "--no-github"), "HEAD")
         self.assertIn("DETACHED HEAD", head)
         self.assertIn("n/a while detached", head)
 
@@ -230,7 +239,7 @@ print(json.dumps(prs))
         (self.repo / "file").write_text("modified again\n")
         for name in ("space name", "line\nbreak", 'quote"name', "café"):
             (self.repo / name).write_text("untracked")
-        status = self.section(self.output("--offline"), "UNCOMMITTED")
+        status = self.section(self.output("--no-check-remote", "--no-github"), "UNCOMMITTED")
         for text in ("1 staged", "1 modified", "4 untracked"):
             self.assertIn(text, status)
 
@@ -241,7 +250,7 @@ print(json.dumps(prs))
         self.commit("main change", "main\n")
         result = self.git("merge", "other", check=False)
         self.assertEqual(result.returncode, 1)
-        output = self.output("--offline")
+        output = self.output("--no-check-remote", "--no-github")
         self.assertIn("MERGE in progress", self.section(output, "HEAD"))
         self.assertNotIn("no rebase/merge/bisect", self.section(output, "HEAD"))
         status = self.section(output, "UNCOMMITTED")
@@ -260,7 +269,7 @@ print(json.dumps(prs))
                     path.write_text(self.root + "\n")
                 try:
                     self.assertIn(label + " in progress",
-                                  self.section(self.output("--offline"), "HEAD"))
+                                  self.section(self.output("--no-check-remote", "--no-github"), "HEAD"))
                 finally:
                     path.rmdir() if path.is_dir() else path.unlink()
 
@@ -269,7 +278,7 @@ print(json.dumps(prs))
             self.git("checkout", "-qB", f"topic{i}", self.root)
             self.commit(f"topic {i}", age=300 - i)
         self.git("checkout", "-q", "main")
-        output = self.output("--offline", "-n", "1")
+        output = self.output("--no-check-remote", "--no-github", "-n", "1")
         branches = self.section(output, "BRANCHES")
         self.assertIn("topic2", branches)
         self.assertIn("* main", branches)
@@ -279,25 +288,25 @@ print(json.dumps(prs))
         self.assertLess(branches.index("topic2"), branches.index("* main"))
         for args in (("-n", "0"), ("--all-branches",)):
             with self.subTest(args=args):
-                branches = self.section(self.output("--offline", *args), "BRANCHES")
+                branches = self.section(self.output("--no-check-remote", "--no-github", *args), "BRANCHES")
                 self.assertNotIn("hidden", branches)
                 for name in ("main", "topic0", "topic1", "topic2"):
                     self.assertIn(name, branches)
-        limited = self.section(self.output("--offline", env={"GIT_OVERVIEW_BRANCH_LIMIT": "1"}), "BRANCHES")
+        limited = self.section(self.output("--no-check-remote", "--no-github", env={"GIT_OVERVIEW_BRANCH_LIMIT": "1"}), "BRANCHES")
         self.assertIn("2 older branch(es) hidden", limited)
 
     def test_branch_name_is_not_shell_code(self):
         name = "$(touch${IFS}PWNED)`false`"
         self.git("branch", name)
-        self.output("--offline", "--all-branches")
+        self.output("--no-check-remote", "--no-github", "--all-branches")
         self.assertFalse((self.repo / "PWNED").exists())
 
     def test_default_branch_limit_and_cli_override(self):
         for i in range(13):
             self.git("branch", f"topic{i:02}")
-        branches = self.section(self.output("--offline"), "BRANCHES")
+        branches = self.section(self.output("--no-check-remote", "--no-github"), "BRANCHES")
         self.assertIn("2 older branch(es) hidden", branches)
-        branches = self.section(self.output("--offline", "--all-branches",
+        branches = self.section(self.output("--no-check-remote", "--no-github", "--all-branches",
                                            env={"GIT_OVERVIEW_BRANCH_LIMIT": "1"}), "BRANCHES")
         self.assertNotIn("hidden", branches)
         for i in range(13):
@@ -313,7 +322,7 @@ print(json.dumps(prs))
 
     def test_invalid_branch_limits_are_rejected(self):
         cases = (("-n", "-1"), ("-n", ""), ("-n", "abc"), ("-n", "1.5"),
-                 ("-n", "--offline"))
+                 ("-n", "--no-check-remote", "--no-github"))
         for args, env in [(args, {}) for args in cases] + [
                 ((), {"GIT_OVERVIEW_BRANCH_LIMIT": "-1"})]:
             with self.subTest(args=args, env=env):
@@ -326,7 +335,7 @@ print(json.dumps(prs))
 
     def test_pipe_in_branch_name_preserves_fields(self):
         self.git("branch", "topic|pipe")
-        branches = self.section(self.output("--offline"), "BRANCHES")
+        branches = self.section(self.output("--no-check-remote", "--no-github"), "BRANCHES")
         self.assertIn("topic|pipe", branches)
         self.assertRegex(branches, r"topic\|pipe\s+\(no up\)\s+1h ago\s+"
                          + self.root[:7] + r"\s+initial subject")
@@ -337,7 +346,7 @@ print(json.dumps(prs))
         (linked / "file").write_text("changed\n")
         (linked / "new").write_text("untracked\n")
         self.git("worktree", "lock", str(linked))
-        output = self.output("--offline")
+        output = self.output("--no-check-remote", "--no-github")
         self.assertRegex(self.section(output, "BRANCHES"), r"(?m)^\+ linked\s")
         worktrees = self.section(output, "WORKTREES")
         self.assertIn("linked worktree", worktrees)
@@ -347,7 +356,7 @@ print(json.dumps(prs))
         self.assertRegex(worktrees, r"(?m)^\* .*repo\s")
         subdir = linked / "subdir"
         subdir.mkdir()
-        linked_output = self.output("--offline", cwd=subdir)
+        linked_output = self.output("--no-check-remote", "--no-github", cwd=subdir)
         self.assertRegex(self.section(linked_output, "BRANCHES"), r"(?m)^\* linked\s")
         self.assertRegex(self.section(linked_output, "WORKTREES"), r"(?m)^\* .*linked worktree\s")
 
@@ -361,7 +370,7 @@ print(json.dumps(prs))
         )
         for home, repo_path, linked_path in cases:
             with self.subTest(home=home):
-                section = self.section(self.output("--offline", env={
+                section = self.section(self.output("--no-check-remote", "--no-github", env={
                     "HOME": home, "COLUMNS": "200"}), "WORKTREES")
                 self.assertRegex(section, r"(?m)^\* " + re.escape(repo_path) + r"\s")
                 self.assertRegex(section, r"(?m)^  " + re.escape(linked_path) + r"\s")
@@ -370,25 +379,25 @@ print(json.dumps(prs))
         linked = self.base / "missing"
         self.git("worktree", "add", "-qb", "missing", str(linked))
         linked.rename(self.base / "moved")
-        section = self.section(self.output("--offline"), "WORKTREES")
+        section = self.section(self.output("--no-check-remote", "--no-github"), "WORKTREES")
         self.assertIn("path is missing", section)
         self.assertIn("[prunable]", section)
 
     def test_worktree_path_with_quote(self):
         linked = self.base / 'quoted"worktree'
         self.git("worktree", "add", "-qb", "quoted", str(linked))
-        section = self.section(self.output("--offline"), "WORKTREES")
+        section = self.section(self.output("--no-check-remote", "--no-github"), "WORKTREES")
         self.assertNotIn("path is missing", section)
         self.assertIn('quoted"worktree', section)
 
     def test_worktree_path_with_newline(self):
         linked = self.base / "line\nbreak"
         self.git("worktree", "add", "-qb", "newline", str(linked))
-        section = self.section(self.output("--offline"), "WORKTREES")
+        section = self.section(self.output("--no-check-remote", "--no-github"), "WORKTREES")
         self.assertNotIn("path is missing", section)
         self.assertRegex(section, r"newline\s+clean")
         self.assertIn(r"line\nbreak", section)
-        active = self.section(self.output("--offline", cwd=linked), "WORKTREES")
+        active = self.section(self.output("--no-check-remote", "--no-github", cwd=linked), "WORKTREES")
         self.assertRegex(active, r"(?m)^\* .*line\\nbreak\s")
 
     def test_read_only_including_indexes_objects_refs_and_linked_worktrees(self):
@@ -407,31 +416,49 @@ print(json.dumps(prs))
         self.git("config", "core.fsmonitor", str(hook))
         self.gh()
         before = [self.snapshot(root) for root in (self.repo, linked)]
-        for args in (("--offline",), ()):
+        for args in (("--no-check-remote", "--no-github",), ()):
             self.output(*args, env={"OVERVIEW_TEST_REMOTE_RC": "0",
                                    "OVERVIEW_TEST_REMOTE": f"{self.root}\trefs/heads/main\n"})
             self.assertEqual(before, [self.snapshot(root) for root in (self.repo, linked)])
             self.assertFalse((self.base / "fsmonitor-invoked").exists())
 
-    def test_offline_skips_all_network_commands(self):
+    def test_disabled_lookups_skip_all_remote_commands(self):
         self.remote()
         self.gh()
-        output = self.output("--offline")
-        self.assertIn("skipped: --offline", self.section(output, "OPEN PRS"))
+        output = self.output("--no-check-remote", "--no-github")
+        self.assertIn("skipped: --no-github", self.section(output, "OPEN PRS"))
+        self.assertIn("skipped: --no-github", self.section(output, "ISSUES"))
         self.assertIn("fetched 2d ago", self.section(output, "HEAD"))
         for tool, args in self.recorded():
             self.assertNotEqual(tool, "gh")
             self.assertFalse(set(args) & {"ls-remote", "fetch", "push", "clone"})
 
-    def test_no_pr_still_checks_remote(self):
+    def test_no_github_still_checks_remote(self):
         self.remote()
         self.gh()
-        output = self.output("--no-pr", env={"OVERVIEW_TEST_REMOTE_RC": "0",
+        output = self.output("--no-github", env={"OVERVIEW_TEST_REMOTE_RC": "0",
                                              "OVERVIEW_TEST_REMOTE": f"{self.root}\trefs/heads/main\n"})
         self.assertIn("checked just now", self.section(output, "HEAD"))
-        self.assertIn("skipped: --no-pr", self.section(output, "OPEN PRS"))
+        self.assertIn("skipped: --no-github", self.section(output, "OPEN PRS"))
+        self.assertIn("skipped: --no-github", self.section(output, "ISSUES"))
         self.assertTrue(any(tool == "git" and "ls-remote" in args for tool, args in self.recorded()))
         self.assertFalse(any(tool == "gh" for tool, _ in self.recorded()))
+
+    def test_no_check_remote_still_queries_github_and_shows_local_counts(self):
+        self.remote()
+        self.commit("local commit")
+        self.gh()
+        output = self.output("--no-check-remote")
+        head = self.section(output, "HEAD")
+        self.assertIn("↑1 ahead", head)
+        self.assertIn("fetched 2d ago", head)
+        self.assertNotIn("checked just now", head)
+        self.assertNotIn("remote unreachable", head)
+        self.assertEqual(self.section(output, "OPEN PRS").strip(), "(none)")
+        self.assertEqual(self.section(output, "ISSUES").strip(), "0 open")
+        calls = self.recorded()
+        self.assertEqual(sum(tool == "gh" for tool, _ in calls), 1)
+        self.assertFalse(any(tool == "git" and "ls-remote" in args for tool, args in calls))
 
     def test_remote_freshness_states(self):
         self.remote()
@@ -442,7 +469,7 @@ print(json.dumps(prs))
         for oid, rc, expected in cases:
             with self.subTest(expected=expected):
                 response = f"{oid}\trefs/heads/main\n" if oid else ""
-                head = self.section(self.output("--no-pr", env={
+                head = self.section(self.output("--no-github", env={
                     "OVERVIEW_TEST_REMOTE": response, "OVERVIEW_TEST_REMOTE_RC": rc}), "HEAD")
                 self.assertIn("in sync", head)
                 self.assertIn(expected, head)
@@ -452,18 +479,18 @@ print(json.dumps(prs))
         for response, expected in (("", "deleted on the remote"),
                                    (f"{self.root}\trefs/heads/main\n", "fetch to compare")):
             with self.subTest(expected=expected):
-                head = self.section(self.output("--no-pr", env={
+                head = self.section(self.output("--no-github", env={
                     "OVERVIEW_TEST_REMOTE": response, "OVERVIEW_TEST_REMOTE_RC": "0"}), "HEAD")
                 self.assertIn("no remote-tracking ref", head)
                 self.assertIn(expected, head)
                 self.assertNotIn("in sync", head)
-        head = self.section(self.output("--offline"), "HEAD")
+        head = self.section(self.output("--no-check-remote", "--no-github"), "HEAD")
         self.assertIn("deleted upstream, or never fetched here", head)
 
     def test_remote_timeout_is_not_confirmation(self):
         self.remote()
         start = time.monotonic()
-        head = self.section(self.output("--no-pr", env={"OVERVIEW_TEST_TIMEOUT": "git"}), "HEAD")
+        head = self.section(self.output("--no-github", env={"OVERVIEW_TEST_TIMEOUT": "git"}), "HEAD")
         self.assert_timeout(start, 5)
         self.assertIn("remote unreachable", head)
         self.assertNotIn("checked just now", head)
@@ -480,7 +507,7 @@ print(json.dumps(prs))
         self.git("branch", "broken")
         self.git("config", "branch.broken.remote", "missing")
         self.git("config", "branch.broken.merge", "refs/heads/target")
-        output = self.output("--offline")
+        output = self.output("--no-check-remote", "--no-github")
         head = self.section(output, "HEAD")
         self.assertIn("↑1 ahead", head)
         self.assertIn("↓1 behind", head)
@@ -495,7 +522,7 @@ print(json.dumps(prs))
         for i in range(7):
             self.git("tag", "-am", f"tag {i}", f"v{i}",
                      env={"GIT_COMMITTER_DATE": f"{NOW - 100 + i} +0000"})
-        output = self.output("--offline")
+        output = self.output("--no-check-remote", "--no-github")
         stashes = self.section(output, "STASHES")
         self.assertIn("stash@{0}", stashes)
         self.assertIn("saved | work", stashes)
@@ -514,24 +541,33 @@ print(json.dumps(prs))
         self.gh(prs)
         section = self.section(self.output(), "OPEN PRS")
         for i, label in enumerate(("draft", "ready", "approved", "changes req")):
-            self.assertRegex(section, rf"#{i + 1}\s+{label}\s+pr-{i}\s+title \| {i}")
+            self.assertRegex(section, rf"#{i + 1}\s+{label}\s+— no checks\s+pr-{i}\s+title \| {i}")
 
     def test_pr_empty_failed_missing_cli_and_timeout_are_distinct(self):
         self.remote()
-        self.assertIn("gh not installed", self.section(self.output(), "OPEN PRS"))
+        output = self.output()
+        for name in ("OPEN PRS", "ISSUES"):
+            self.assertIn("gh not installed", self.section(output, name))
         self.gh()
-        self.assertEqual(self.section(self.output(), "OPEN PRS").strip(), "(none)")
+        output = self.output()
+        self.assertEqual(self.section(output, "OPEN PRS").strip(), "(none)")
+        self.assertEqual(self.section(output, "ISSUES").strip(), "0 open")
         self.gh(rc=1)
-        self.assertIn("gh failed", self.section(self.output(), "OPEN PRS"))
+        output = self.output()
+        for name in ("OPEN PRS", "ISSUES"):
+            self.assertIn("gh failed", self.section(output, name))
         self.gh()
         start = time.monotonic()
-        self.assertIn("timed out after 6s", self.section(self.output(
-            env={"OVERVIEW_TEST_TIMEOUT": "gh"}), "OPEN PRS"))
+        output = self.output(env={"OVERVIEW_TEST_TIMEOUT": "gh"})
         self.assert_timeout(start, 6)
+        for name in ("OPEN PRS", "ISSUES"):
+            self.assertIn("timed out after 6s", self.section(output, name))
 
     def test_no_remote_does_not_query_github(self):
         self.gh()
-        self.assertIn("no remote configured", self.section(self.output(), "OPEN PRS"))
+        output = self.output()
+        for name in ("OPEN PRS", "ISSUES"):
+            self.assertIn("no remote configured", self.section(output, name))
         self.assertFalse(any(tool == "gh" for tool, _ in self.recorded()))
 
     def test_query_failures_are_not_reported_as_empty_or_clean(self):
@@ -541,19 +577,19 @@ print(json.dumps(prs))
                                (["for-each-ref", "refs/tags", "--count=5"], "TAGS"),
                                (["reflog"], "RECENT (reflog)")):
             with self.subTest(section=section):
-                output = self.output("--offline", env={"OVERVIEW_TEST_FAIL": json.dumps(query)})
+                output = self.output("--no-check-remote", "--no-github", env={"OVERVIEW_TEST_FAIL": json.dumps(query)})
                 content = self.section(output, section)
                 self.assertIn("unavailable:", content)
                 self.assertNotIn("(none)", content)
                 self.assertNotIn("clean", content)
 
     def test_color_flags_and_no_color_environment(self):
-        self.assertNotIn("\x1b[", self.output("--offline"))
-        self.assertNotIn("\x1b[", self.output("--offline", "--no-color"))
-        self.assertNotIn("\x1b[", self.output("--offline", "--color=auto", env={"NO_COLOR": "1"}))
+        self.assertNotIn("\x1b[", self.output("--no-check-remote", "--no-github"))
+        self.assertNotIn("\x1b[", self.output("--no-check-remote", "--no-github", "--no-color"))
+        self.assertNotIn("\x1b[", self.output("--no-check-remote", "--no-github", "--color=auto", env={"NO_COLOR": "1"}))
         for flag in ("--color", "--color=always"):
-            self.assertIn("\x1b[", self.output("--offline", flag, env={"NO_COLOR": "1"}))
-        self.assertNotIn("\x1b[", self.output("--offline", "--color", "--color=never"))
+            self.assertIn("\x1b[", self.output("--no-check-remote", "--no-github", flag, env={"NO_COLOR": "1"}))
+        self.assertNotIn("\x1b[", self.output("--no-check-remote", "--no-github", "--color", "--color=never"))
 
     def test_width_clipping_and_current_branch_tail(self):
         name = "feature/" + "long-prefix-" * 4 + "distinct-tail"
@@ -561,7 +597,7 @@ print(json.dumps(prs))
         self.commit("subject " + "x" * 160)
         for width in (60, 80, 120):
             with self.subTest(width=width):
-                output = self.output("--offline", env={"COLUMNS": str(width)})
+                output = self.output("--no-check-remote", "--no-github", env={"COLUMNS": str(width)})
                 branches = self.section(output, "BRANCHES")
                 self.assertIn("…", branches)
                 self.assertIn("distinct-tail", branches)
@@ -576,7 +612,7 @@ print(json.dumps(prs))
         for directory in (self.repo, linked):
             self.git("mv", "file", "?? renamed\nfile", cwd=directory)
             (directory / "?? renamed\nfile").write_text("modified again\n")
-        output = self.output("--offline")
+        output = self.output("--no-check-remote", "--no-github")
         status = self.section(output, "UNCOMMITTED")
         self.assertIn("1 staged", status)
         self.assertIn("1 modified", status)
@@ -589,7 +625,7 @@ print(json.dumps(prs))
         linked = self.base / "trailing\n"
         self.git("worktree", "add", "-qb", "linked", str(linked))
         self.git("worktree", "lock", "--reason", "reason\nbranch refs/heads/fake", str(linked))
-        worktrees = self.section(self.output("--offline", cwd=linked), "WORKTREES")
+        worktrees = self.section(self.output("--no-check-remote", "--no-github", cwd=linked), "WORKTREES")
         self.assertRegex(worktrees, r"(?m)^\* .*trailing\\n\s")
         self.assertRegex(worktrees, r"linked\s+clean\s+\[locked\]")
         self.assertNotIn("fake", worktrees)
@@ -598,7 +634,7 @@ print(json.dumps(prs))
     def test_non_utf8_worktree_path_is_used_without_loss(self):
         linked = self.base / os.fsdecode(b"invalid-\xff")
         self.git("worktree", "add", "-qb", "linked", str(linked))
-        worktrees = self.section(self.output("--offline", cwd=linked), "WORKTREES")
+        worktrees = self.section(self.output("--no-check-remote", "--no-github", cwd=linked), "WORKTREES")
         self.assertNotIn("path is missing", worktrees)
         self.assertRegex(worktrees, r"linked\s+clean")
         self.assertIn(r"invalid-\xff", worktrees)
@@ -617,15 +653,106 @@ print(json.dumps(prs))
                 self.assertNotIn("(none)", section)
         self.gh([dict(number=8, title="no review", headRefName="unreviewed",
                       isDraft=False, reviewDecision=None)])
-        self.assertRegex(self.section(self.output(), "OPEN PRS"), r"#8\s+ready\s+unreviewed")
+        self.assertRegex(self.section(self.output(), "OPEN PRS"), r"#8\s+ready\s+— no checks\s+unreviewed")
         gh_args = [args for tool, args in self.recorded() if tool == "gh"]
-        self.assertTrue(all("--json" in args and "--template" not in args for args in gh_args))
+        self.assertTrue(all(args[:2] == ["api", "graphql"] and "--template" not in args
+                            for args in gh_args))
+
+    def test_pr_ci_states_are_independent_of_review_status(self):
+        self.remote()
+        cases = (("SUCCESS", "✓ passing"), ("FAILURE", "✗ failing"),
+                 ("ERROR", "✗ error"), ("PENDING", "… pending"),
+                 ("EXPECTED", "… pending"), (None, "— no checks"),
+                 ("NEW_STATE", "? unknown"))
+        prs = [dict(number=i + 1, title=f"CI case {i}", headRefName=f"pr-{i}",
+                    isDraft=False, reviewDecision="APPROVED",
+                    commits={"nodes": [{"commit": {"statusCheckRollup":
+                             None if state is None else {"state": state}}}]})
+               for i, (state, _) in enumerate(cases)]
+        self.gh(prs)
+        output = self.output("--color")
+        section = self.section(output, "OPEN PRS")
+        for i, (_, label) in enumerate(cases):
+            self.assertRegex(section, rf"#{i + 1}\s+approved\s+{re.escape(label)}\s+pr-{i}")
+        self.assertIn("\x1b[32m✓ passing", output)
+        self.assertIn("\x1b[31m✗ failing", output)
+
+    def test_github_single_request_includes_issue_count_newest_and_age(self):
+        self.remote()
+        issue = dict(number=19, title="Raptors can open doors",
+                     createdAt=datetime.fromtimestamp(NOW - 7260, timezone.utc).isoformat())
+        self.gh([dict(number=12, title="Restore fence power", headRefName="fix/raptor-fences",
+                      isDraft=False, reviewDecision="CHANGES_REQUESTED")],
+                issue_count=7, newest_issue=issue)
+        output = self.output(env={"TZ": "America/New_York"})
+        self.assertIn("#12", self.section(output, "OPEN PRS"))
+        self.assertEqual(self.section(output, "ISSUES").strip(),
+                         "7 open   newest: #19 Raptors can open doors (2h ago)")
+        gh_args = [args for tool, args in self.recorded() if tool == "gh"]
+        self.assertEqual(len(gh_args), 1)
+        args = gh_args[0]
+        self.assertEqual(args[:2], ["api", "graphql"])
+        self.assertIn("owner={owner}", args)
+        self.assertIn("name={repo}", args)
+        query = next(arg for arg in args if arg.startswith("query="))
+        for field in ("pullRequests", "issues", "totalCount", "createdAt", "statusCheckRollup"):
+            self.assertIn(field, query)
+        self.assertNotIn("--paginate", args)
+
+    def test_github_partial_and_malformed_data_never_look_empty_or_passing(self):
+        self.remote()
+        self.gh()
+        pr = dict(number=1, title="Fix fences", headRefName="fences",
+                  isDraft=False, reviewDecision="APPROVED")
+        malformed = [
+            {"errors": [{"message": "denied"}], **self.github_response()},
+            {"data": {"repository": None}},
+            self.github_response([{**pr, "commits": {"nodes": []}}]),
+            self.github_response([{**pr, "commits": {"nodes": [{"commit": {}}]}}]),
+            self.github_response([{**pr, "commits": {"nodes": [{"commit": {
+                "statusCheckRollup": {"state": None}}}]}}]),
+            self.github_response(issue_count=True),
+            self.github_response(issue_count=-1),
+            self.github_response(issue_count=1),
+        ]
+        for created in (None, "not a date", "2026-09-01T00:00:00"):
+            malformed.append(self.github_response(issue_count=1, newest_issue={
+                "number": 19, "title": "Raptors", "createdAt": created}))
+        for response in malformed:
+            with self.subTest(response=response):
+                output = self.output(env={"OVERVIEW_TEST_GH_RAW": json.dumps(response)})
+                for name in ("OPEN PRS", "ISSUES"):
+                    section = self.section(output, name)
+                    self.assertIn("gh failed", section)
+                    for misleading in ("(none)", "0 open", "✓ passing", "— no checks"):
+                        self.assertNotIn(misleading, section)
+
+    def test_github_rows_fit_terminal_and_escape_issue_titles(self):
+        self.remote()
+        issue = dict(number=1234567, title='title | "quote"\nnext ' + "x" * 150,
+                     createdAt=datetime.fromtimestamp(NOW - 7260, timezone.utc)
+                     .isoformat().replace("+00:00", "Z"))
+        self.gh([dict(number=1234567, title="PR title " + "x" * 150,
+                      headRefName="feature/" + "long-branch-" * 5,
+                      isDraft=False, reviewDecision="CHANGES_REQUESTED")],
+                issue_count=27, newest_issue=issue)
+        for width in (60, 80, 120):
+            with self.subTest(width=width):
+                output = self.output("--color", env={"COLUMNS": str(width)})
+                for name in ("OPEN PRS", "ISSUES"):
+                    section = self.section(output, name)
+                    self.assertTrue(all(len(line) <= width for line in section.splitlines()), section)
+                    self.assertIn("…", section)
+                issues = self.section(output, "ISSUES")
+                self.assertIn("27 open", issues)
+                self.assertIn("(2h ago)", issues)
+                self.assertIn(r'title | "quote"\nnext', issues)
 
     def test_tag_delimiters_and_objects_without_dates(self):
         self.git("tag", "blob|tag", self.git("rev-parse", "HEAD:file").strip())
         self.git("tag", "tree|tag", "HEAD^{tree}")
         self.git("tag", "commit|tag")
-        tags = self.section(self.output("--offline"), "TAGS")
+        tags = self.section(self.output("--no-check-remote", "--no-github"), "TAGS")
         for name in ("blob|tag", "tree|tag", "commit|tag"):
             self.assertIn(name, tags)
         self.assertRegex(tags, r"blob\|tag\s+—")
@@ -643,10 +770,10 @@ print(json.dumps(prs))
     def test_worktree_query_and_linked_status_failures(self):
         linked = self.base / "linked"
         self.git("worktree", "add", "-qb", "linked", str(linked))
-        output = self.output("--offline", env={"OVERVIEW_TEST_FAIL": json.dumps(["-C", str(linked), "status"])})
+        output = self.output("--no-check-remote", "--no-github", env={"OVERVIEW_TEST_FAIL": json.dumps(["-C", str(linked), "status"])})
         self.assertRegex(self.section(output, "WORKTREES"), r"linked\s+\(status failed\)")
         self.assertEqual(self.section(output, "UNCOMMITTED").strip(), "clean")
-        output = self.output("--offline", env={"OVERVIEW_TEST_FAIL": json.dumps(["worktree", "list"])})
+        output = self.output("--no-check-remote", "--no-github", env={"OVERVIEW_TEST_FAIL": json.dumps(["worktree", "list"])})
         self.assertIn("unavailable:", self.section(output, "WORKTREES"))
         self.assertNotIn("just this one", self.section(output, "WORKTREES"))
 
@@ -654,7 +781,7 @@ print(json.dumps(prs))
         self.remote()
         fetch = self.repo / ".git" / "FETCH_HEAD"
         os.utime(fetch, (NOW - 9 * 86400, NOW - 9 * 86400))
-        head = self.section(self.output("--offline", env={
+        head = self.section(self.output("--no-check-remote", "--no-github", env={
             "OVERVIEW_TEST_FAIL": json.dumps(["rev-list"])}), "HEAD")
         self.assertIn("ahead/behind unavailable", head)
         self.assertIn("fetched 9d ago — stale", head)
@@ -663,14 +790,14 @@ print(json.dumps(prs))
     def test_width_clamps_without_terminal_utilities(self):
         for requested, expected in (("30", 60), ("200", 120), ("bad", 80)):
             with self.subTest(requested=requested):
-                output = self.output("--offline", env={"COLUMNS": requested})
+                output = self.output("--no-check-remote", "--no-github", env={"COLUMNS": requested})
                 header = next(line for line in output.splitlines() if line.lstrip().startswith("HEAD ─"))
                 self.assertEqual(len(header), expected - 2)
 
     def test_help_and_invalid_options_outside_repository(self):
         help_result = self.run_overview("--help", cwd=self.base)
         self.assertIn(b"Usage: git-overview", help_result.stdout)
-        for flag in ("--unknown", "--color=invalid"):
+        for flag in ("--unknown", "--color=invalid", "--offline"):
             with self.subTest(flag=flag):
                 result = self.run_overview(flag, cwd=self.base, ok=False)
                 self.assertEqual(result.returncode, 2)
