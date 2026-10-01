@@ -254,7 +254,7 @@ print(os.environ['OVERVIEW_TEST_GITHUB'])
         self.assertIn("MERGE in progress", self.section(output, "HEAD"))
         self.assertNotIn("no rebase/merge/bisect", self.section(output, "HEAD"))
         status = self.section(output, "UNCOMMITTED")
-        self.assertIn("1 conflicted", status)
+        self.assertRegex(status, r"\b1 conflict(?:\s|$)")
         self.assertIn("UU file", status)
 
     def test_operation_indicators(self):
@@ -349,6 +349,8 @@ print(os.environ['OVERVIEW_TEST_GITHUB'])
         output = self.output("--no-check-remote", "--no-github")
         self.assertRegex(self.section(output, "BRANCHES"), r"(?m)^\+ linked\s")
         worktrees = self.section(output, "WORKTREES")
+        self.assertRegex(worktrees.splitlines()[0], r"WORKTREE\s+BRANCH\s+STATUS")
+        self.assertNotIn(self.root[:7], worktrees)
         self.assertIn("linked worktree", worktrees)
         self.assertIn("1 changed", worktrees)
         self.assertIn("1 untracked", worktrees)
@@ -359,6 +361,21 @@ print(os.environ['OVERVIEW_TEST_GITHUB'])
         linked_output = self.output("--no-check-remote", "--no-github", cwd=subdir)
         self.assertRegex(self.section(linked_output, "BRANCHES"), r"(?m)^\* linked\s")
         self.assertRegex(self.section(linked_output, "WORKTREES"), r"(?m)^\* .*linked worktree\s")
+
+    def test_detached_worktree_shows_head_in_branch_column(self):
+        linked = self.base / "detached"
+        self.git("worktree", "add", "-qd", str(linked))
+        sha = self.git("rev-parse", "--short", "HEAD").strip()
+        for width in (60, 80, 120):
+            with self.subTest(width=width):
+                worktrees = self.section(self.output("--no-check-remote", "--no-github",
+                                                    env={"COLUMNS": str(width)}), "WORKTREES")
+                self.assertRegex(worktrees.splitlines()[0], r"WORKTREE\s+BRANCH\s+STATUS")
+                self.assertNotIn("SHA", worktrees.splitlines()[0])
+                self.assertRegex(worktrees, re.escape(sha) + r" \(detached\)\s+clean")
+                self.assertEqual(worktrees.count(sha), 1)
+        colored = self.output("--no-check-remote", "--no-github", "--color")
+        self.assertIn("\x1b[33m" + sha + "\x1b[0m \x1b[2m(detached)\x1b[0m", colored)
 
     def test_worktree_home_shortening_respects_directory_boundaries(self):
         linked = self.base / "repository" / "repo"
@@ -543,6 +560,22 @@ print(os.environ['OVERVIEW_TEST_GITHUB'])
         for i, label in enumerate(("draft", "ready", "approved", "changes req")):
             self.assertRegex(section, rf"#{i + 1}\s+{label}\s+— no checks\s+pr-{i}\s+title \| {i}")
 
+    def test_compact_pr_columns_preserve_titles_at_80_columns(self):
+        self.remote()
+        cases = (
+            ("feat/storm-tracker", "Track opening-day storms", False, "FAILURE"),
+            ("feat/jeep-tour", "Vehicle movement attracts T. rex", False, "SUCCESS"),
+            ("feat/raptor-doors", "Detect raptors opening doors", True, "PENDING"),
+        )
+        self.gh([dict(number=i + 1, headRefName=branch, title=title, isDraft=draft,
+                      reviewDecision=None, commits={"nodes": [{"commit": {
+                          "statusCheckRollup": {"state": ci}}}]})
+                 for i, (branch, title, draft, ci) in enumerate(cases)])
+        section = self.section(self.output(env={"COLUMNS": "80"}), "OPEN PRS")
+        for _, title, _, _ in cases:
+            self.assertIn(title, section)
+        self.assertTrue(all(len(line) <= 80 for line in section.splitlines()), section)
+
     def test_pr_empty_failed_missing_cli_and_timeout_are_distinct(self):
         self.remote()
         output = self.output()
@@ -687,7 +720,7 @@ print(os.environ['OVERVIEW_TEST_GITHUB'])
         output = self.output(env={"TZ": "America/New_York"})
         self.assertIn("#12", self.section(output, "OPEN PRS"))
         self.assertEqual(self.section(output, "ISSUES").strip(),
-                         "7 open   newest: #19 Raptors can open doors (2h ago)")
+                         "7 open   latest: #19 Raptors can open doors (2h ago)")
         gh_args = [args for tool, args in self.recorded() if tool == "gh"]
         self.assertEqual(len(gh_args), 1)
         args = gh_args[0]

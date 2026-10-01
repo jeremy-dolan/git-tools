@@ -530,12 +530,12 @@ class Renderer:
     def section(self, title):
         print("\n" + self.c(" " + title + " " + "─" * max(0, self.cols - len(title) - 4), "bold", "cyan"))
 
-    def field(self, label, main, plain=None, note="", note_plain=""):
+    def field(self, label, main, plain=None, note="", note_plain="", gap=3):
         line = "  " + self.c(label.ljust(9), "dim") + " " + main
         if not note_plain:
             print(line)
-        elif 12 + len(plain) + 3 + len(note_plain) <= self.cols:
-            print(line + "   " + note)
+        elif 12 + len(plain) + gap + len(note_plain) <= self.cols:
+            print(line + " " * gap + note)
         else:
             print(line + "\n" + " " * 12 + note)
 
@@ -561,7 +561,7 @@ class Renderer:
         else:
             self.field("commit", self.c("no commits yet", "dim"))
         main, plain, note, note_plain = self.upstream(head)
-        self.field("upstream", main, plain, note, note_plain)
+        self.field("upstream", main, plain, note, note_plain, gap=2)
 
     def upstream(self, head):
         note, note_plain = "", ""
@@ -581,8 +581,8 @@ class Renderer:
                     pieces.append((f"↓{behind} behind", "yellow"))
                 sync = "  ".join(text for text, _ in pieces)
                 colored = "  ".join(self.c(text, color) for text, color in pieces)
-            plain = visible(head.upstream) + "   " + sync
-            main = visible(head.upstream) + "   " + colored
+            plain = visible(head.upstream) + "  " + sync
+            main = visible(head.upstream) + "  " + colored
             fetched = age(head.fetch_ts, self.now) if head.fetch_ts is not None else ""
             if head.remote_state == "same":
                 note_plain = "(checked just now)"
@@ -611,8 +611,8 @@ class Renderer:
         elif head.remote and head.merge:
             merge = head.merge[11:] if head.merge.startswith("refs/heads/") else head.merge
             target = visible(head.remote + "/" + merge)
-            plain = target + "   no remote-tracking ref"
-            main = target + "   " + self.c("no remote-tracking ref", "red")
+            plain = target + "  no remote-tracking ref"
+            main = target + "  " + self.c("no remote-tracking ref", "red")
             if head.remote_state in ("gone", "unfetched"):
                 message, color = (("deleted on the remote", "red") if head.remote_state == "gone"
                                   else ("it exists on the remote — fetch to compare", "yellow"))
@@ -630,7 +630,8 @@ class Renderer:
     def status_summary(self, status, detailed=False):
         pieces = []
         if status.conflicts:
-            pieces.append(self.c(f"{len(status.conflicts)} conflicted", "red", "bold"))
+            count = len(status.conflicts)
+            pieces.append(self.c(f"{count} conflict" + ("s" if count != 1 else ""), "red", "bold"))
         if detailed:
             if status.staged:
                 pieces.append(f"{status.staged} staged")
@@ -667,9 +668,9 @@ class Renderer:
                  else calendar(row.timestamp) for row in rows]
         namew = min(21, max(6, *(len(visible(row.name)) for row in rows)))
         syncw = max(4, *(len(row.sync) for row in rows))
-        whenw = max(9, *(len(when) for when in whens))
+        whenw = max(6, *(len(when) for when in whens))
         shaw = max(3, *(len(row.sha) for row in rows))
-        print("  " + self.c(f"{'BRANCH':<{namew}}  {'SYNC':<{syncw}} {'COMMITTED':<{whenw}} {'SHA':<{shaw}} SUBJECT", "dim"))
+        print("  " + self.c(f"{'BRANCH':<{namew}}  {'SYNC':<{syncw}} {'COMMIT':<{whenw}} {'SHA':<{shaw}} SUBJECT", "dim"))
         avail = self.cols - (namew + syncw + whenw + shaw + 7)
         for row, when in zip(rows, whens):
             mark = self.c("*", "green", "bold") if row.name == current else self.c("+", "cyan") if row.name in checked_out else " "
@@ -700,11 +701,13 @@ class Renderer:
         paths = [visible("~" + tree.path[len(home):] if home and
                          (tree.path == home or tree.path.startswith(home + os.sep))
                          else tree.path) for tree in trees]
-        shaw = max(3, *(len(tree.sha) for tree in trees))
-        refw = min(21, max(6, *(len(visible(tree.ref)) for tree in trees)))
-        pathw = min(max(8, *(len(path) for path in paths)), max(12, self.cols - refw - shaw - 30))
-        print("  " + self.c(f"{'WORKTREE':<{pathw}}  {'SHA':<{shaw}}  {'BRANCH':<{refw}}  STATUS", "dim"))
-        for tree, path in zip(trees, paths):
+        refs = [(tree.sha or "—") + " (detached)" if tree.ref == "(detached)" else visible(tree.ref)
+                for tree in trees]
+        refw = max(len("BRANCH"), *(len(ref) if tree.ref == "(detached)" else min(21, len(ref))
+                                          for tree, ref in zip(trees, refs)))
+        pathw = min(max(8, *(len(path) for path in paths)), max(12, self.cols - refw - 30))
+        print("  " + self.c(f"{'WORKTREE':<{pathw}}  {'BRANCH':<{refw}}  STATUS", "dim"))
+        for tree, path, ref in zip(trees, paths, refs):
             if tree.bare:
                 status = self.c("—", "dim")
             elif tree.missing:
@@ -716,9 +719,13 @@ class Renderer:
             mark = self.c("*", "green", "bold") if tree.path == toplevel else " "
             marks = ("   " + self.c("[locked]", "yellow") if tree.locked else "")
             marks += "   " + self.c("[prunable]", "red") if tree.prunable else ""
+            if tree.ref == "(detached)":
+                ref_text = (self.c(tree.sha or "—", "yellow") + " " + self.c("(detached)", "dim")
+                            + " " * (refw - len(ref)))
+            else:
+                ref_text = self.c(clip(refw, ref, tail=True).ljust(refw), "cyan")
             print(mark + " " + clip(pathw, path, tail=True).ljust(pathw)
-                  + "  " + self.c((tree.sha or "—").ljust(shaw), "yellow")
-                  + "  " + self.c(clip(refw, visible(tree.ref), tail=True).ljust(refw), "cyan")
+                  + "  " + ref_text
                   + "  " + status + marks)
 
     def stashes(self, rows):
@@ -762,9 +769,7 @@ class Renderer:
         elif not github.prs:
             self.none()
         else:
-            numberw = max(6, *(len(str(pr["number"])) + 1 for pr in github.prs))
-            branchw = min(24, max(8, self.cols - numberw - 12 - 12 - 20))
-            titlew = self.cols - numberw - 12 - 12 - branchw - 7
+            rows = []
             for pr in github.prs:
                 flag, colors = ("draft", ("dim",)) if pr["isDraft"] else ("ready", ())
                 if pr["reviewDecision"] == "CHANGES_REQUESTED":
@@ -779,9 +784,17 @@ class Renderer:
                     "EXPECTED": ("… pending", "yellow"),
                     None: ("— no checks", "dim"),
                 }.get(pr["ci"], ("? unknown", "yellow"))
-                print("  " + self.c(("#" + str(pr["number"])).ljust(numberw), "yellow") + " "
-                      + self.c(flag.ljust(12), *colors) + " "
-                      + self.c(ci.ljust(12), ci_color) + " "
+                rows.append((pr, flag, colors, ci, ci_color))
+            numberw = max(len(str(pr["number"])) + 1 for pr in github.prs)
+            flagw = max(len(flag) for _, flag, _, _, _ in rows)
+            ciw = max(len(ci) for _, _, _, ci, _ in rows)
+            branchw = min(24, max(8, *(len(visible(pr["headRefName"])) for pr in github.prs)),
+                          max(8, self.cols - numberw - flagw - ciw - 20 - 10))
+            titlew = self.cols - numberw - flagw - ciw - branchw - 10
+            for pr, flag, colors, ci, ci_color in rows:
+                print("  " + self.c(("#" + str(pr["number"])).ljust(numberw), "yellow") + "  "
+                      + self.c(flag.ljust(flagw), *colors) + "  "
+                      + self.c(ci.ljust(ciw), ci_color) + "  "
                       + self.c(clip(branchw, visible(pr["headRefName"])).ljust(branchw), "blue")
                       + "  " + clip(titlew, visible(pr["title"])))
 
@@ -795,7 +808,7 @@ class Renderer:
         if issue is None:
             print(prefix)
             return
-        prefix += "   newest: #" + str(issue["number"]) + " "
+        prefix += "   latest: #" + str(issue["number"]) + " "
         when = " (" + age(issue["timestamp"], self.now) + " ago)"
         print(prefix + clip(self.cols - len(prefix) - len(when), visible(issue["title"]))
               + self.c(when, "dim"))
