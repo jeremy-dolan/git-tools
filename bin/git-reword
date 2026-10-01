@@ -409,6 +409,8 @@ def main():
     ancestor = git.run("merge-base", "--is-ancestor", target.decode(), old.decode(), allowed=(0, 1))
     if ancestor.returncode:
         raise RewordError("target is not an ancestor of the original HEAD")
+    # Merge-side parents outside this range keep their IDs. Parent-first order
+    # lets us substitute rewritten parent IDs while preserving merge topology.
     descendants = git.read("rev-list", "--reverse", "--topo-order", "--ancestry-path",
                            target.decode() + ".." + old.decode()).splitlines()
     order = [target, *descendants]

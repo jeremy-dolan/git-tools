@@ -126,6 +126,8 @@ class Git:
         self.env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1")
 
     def run(self, *args, timeout=None, env=None):
+        # Avoid status refreshing the on-disk index or running a configured
+        # fsmonitor program: both would violate the read-only contract.
         return run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", *args],
                    env=dict(self.env, **(env or {})), timeout=timeout)
 
@@ -252,6 +254,8 @@ def collect_worktrees(git):
 
 
 def collect_config(git):
+    # %(upstream) is empty both when no upstream is configured and when the
+    # remote or its fetch refspec cannot map it to a tracking ref.
     result = git.run("config", "--null", "--get-regexp", r"^branch\..*\.(remote|merge)$")
     config = {}
     for entry in result.data.split(b"\0"):
@@ -288,6 +292,8 @@ def collect_head(git, options):
     directory = Path(git.text("rev-parse", "--absolute-git-dir"))
     common = Path(git.text("rev-parse", "--path-format=absolute", "--git-common-dir"))
     branch = git.text("symbolic-ref", "--quiet", "--short", "HEAD")
+    # Keep the configured upstream too: @{upstream} cannot resolve a tracking
+    # ref that was deleted or has never been fetched here.
     head = Head(branch, bool(git.text("remote")),
                 git.text("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"),
                 git.text("config", "--get", "branch." + branch + ".remote") if branch else "",
@@ -312,6 +318,8 @@ def collect_head(git, options):
         head.operations.append("BISECT in progress")
     try:
         fetch = (common / "FETCH_HEAD").stat()
+        # A fetch that obtained no refs can leave an empty, freshly stamped
+        # file; its timestamp alone is not evidence of fetched remote refs.
         if head.has_remote and fetch.st_size:
             head.fetch_ts = int(fetch.st_mtime)
     except OSError:
@@ -326,6 +334,9 @@ def collect_head(git, options):
                 pass
     if options.network and head.remote and head.merge:
         have = git.text("rev-parse", "--verify", "--quiet", "refs/remotes/" + head.upstream) if head.upstream else ""
+        # ls-remote reads advertised refs without downloading objects, moving
+        # refs, or writing FETCH_HEAD. fetch --dry-run can still download
+        # objects, so it is unsuitable for this read-only freshness check.
         result = git.run("ls-remote", "--quiet", head.remote, head.merge,
                          timeout=5, env=network_env())
         advertised = {}
