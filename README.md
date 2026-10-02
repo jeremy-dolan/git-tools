@@ -9,4 +9,4 @@ Some Git utilities. Installs with `install-git-tools` from my
 
 If placed in $PATH, these can run as git subcommands: `git overview`, `git reword`:
 
-![Demo of git-overview](assets/git-overview.gif)
+<img src="assets/git-overview.gif" width="737" alt="Demo of git-overview">
