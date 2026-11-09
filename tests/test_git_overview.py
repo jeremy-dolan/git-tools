@@ -158,6 +158,8 @@ os.execv({REAL_GIT!r}, [{REAL_GIT!r}, *args])
         self.git("config", "branch.main.merge", "refs/heads/main")
         if tracking:
             self.git("update-ref", "refs/remotes/origin/main", self.root)
+            # Only FETCH_HEAD dates the fetch unless a test adds a reflog entry.
+            shutil.rmtree(self.repo / ".git" / "logs" / "refs" / "remotes")
         fetch_head = self.repo / ".git" / "FETCH_HEAD"
         fetch_head.write_text(f"{self.root}\t\tbranch 'main' of origin\n")
         os.utime(fetch_head, (NOW - 172860, NOW - 172860))
@@ -181,6 +183,11 @@ if os.environ.get('OVERVIEW_TEST_TIMEOUT') == 'gh':
     import time
     record('timeout-pid', [os.getpid()])
     time.sleep(30)
+if any('/compare/' in arg for arg in sys.argv[1:]):
+    if int(os.environ.get('OVERVIEW_TEST_COMPARE_RC', '0')):
+        sys.exit(int(os.environ['OVERVIEW_TEST_COMPARE_RC']))
+    print(os.environ.get('OVERVIEW_TEST_COMPARE', ''))
+    sys.exit(0)
 if 'OVERVIEW_TEST_GH_RAW' in os.environ:
     print(os.environ['OVERVIEW_TEST_GH_RAW'])
     sys.exit(0)
@@ -455,7 +462,7 @@ print(os.environ['OVERVIEW_TEST_GITHUB'])
         self.gh()
         output = self.output("--no-github", env={"OVERVIEW_TEST_REMOTE_RC": "0",
                                              "OVERVIEW_TEST_REMOTE": f"{self.root}\trefs/heads/main\n"})
-        self.assertIn("checked just now", self.section(output, "HEAD"))
+        self.assertIn("✓ up to date with remote", self.section(output, "HEAD"))
         self.assertIn("skipped: --no-github", self.section(output, "OPEN PRS"))
         self.assertIn("skipped: --no-github", self.section(output, "ISSUES"))
         self.assertTrue(any(tool == "git" and "ls-remote" in args for tool, args in self.recorded()))
@@ -467,29 +474,137 @@ print(os.environ['OVERVIEW_TEST_GITHUB'])
         self.gh()
         output = self.output("--no-check-remote")
         head = self.section(output, "HEAD")
-        self.assertIn("↑1 ahead", head)
-        self.assertIn("fetched 2d ago", head)
-        self.assertNotIn("checked just now", head)
-        self.assertNotIn("remote unreachable", head)
+        self.assertIn("upstream  ↑1 ahead of cached origin/main  (fetched 2d ago)", head)
+        self.assertNotIn("up to date with remote", head)
+        self.assertNotIn("couldn't reach", head)
         self.assertEqual(self.section(output, "OPEN PRS").strip(), "(none)")
         self.assertEqual(self.section(output, "ISSUES").strip(), "0 open")
         calls = self.recorded()
         self.assertEqual(sum(tool == "gh" for tool, _ in calls), 1)
         self.assertFalse(any(tool == "git" and "ls-remote" in args for tool, args in calls))
 
+    def head_against_remote(self, oid, *args, rc="0", env=None):
+        response = f"{oid}\trefs/heads/main\n" if oid else ""
+        return self.section(self.output(*args, env=dict({
+            "OVERVIEW_TEST_REMOTE": response, "OVERVIEW_TEST_REMOTE_RC": rc}, **(env or {}))), "HEAD")
+
+    def freshness_line(self, head):
+        lines = head.splitlines()
+        index = next(i for i, line in enumerate(lines) if line.lstrip().startswith("upstream"))
+        return "\n".join(lines[index + 1:]).strip()
+
     def test_remote_freshness_states(self):
         self.remote()
-        cases = ((self.root, "0", "checked just now"),
-                 ("1" * 40, "0", "counts stale"),
-                 ("", "0", "no longer exists on origin"),
-                 ("", "128", "remote unreachable"))
+        os.utime(self.repo / ".git" / "FETCH_HEAD", (NOW - 9 * 86400, NOW - 9 * 86400))
+        cases = ((self.root, "0", "✓ up to date with remote"),
+                 ("1" * 40, "0", "⚠ remote branch has changed since your fetch; "
+                                 "to view: git fetch && git log --oneline ..@{u}"),
+                 ("", "0", "⚠ main no longer exists on origin"),
+                 ("", "128", "⚠ couldn't reach origin to check"))
         for oid, rc, expected in cases:
             with self.subTest(expected=expected):
-                response = f"{oid}\trefs/heads/main\n" if oid else ""
-                head = self.section(self.output("--no-github", env={
-                    "OVERVIEW_TEST_REMOTE": response, "OVERVIEW_TEST_REMOTE_RC": rc}), "HEAD")
-                self.assertIn("in sync", head)
-                self.assertIn(expected, head)
+                head = self.head_against_remote(oid, "--no-github", rc=rc, env={"COLUMNS": "120"})
+                # The upstream line compares against the cached ref only.
+                self.assertRegex(head, r"upstream\s+even with cached origin/main  \(")
+                self.assertEqual(self.freshness_line(head), expected)
+                # An answered check makes the fetch age informational.
+                self.assertEqual("— stale" in head, rc != "0", head)
+        head = self.section(self.output("--no-check-remote", "--no-github"), "HEAD")
+        self.assertEqual(self.freshness_line(head), "")
+        self.assertIn("fetched 9d ago — stale", head)
+        self.assertIn("\x1b[32meven\x1b[0m \x1b[2mwith\x1b[0m \x1b[2mcached\x1b[0m origin/main",
+                      self.output("--no-check-remote", "--no-github", "--color"))
+        self.commit("local commit")
+        self.assertIn("\x1b[33m↑1 ahead\x1b[0m \x1b[2mof\x1b[0m \x1b[2mcached\x1b[0m origin/main",
+                      self.output("--no-check-remote", "--no-github", "--color"))
+
+    def test_remote_tip_already_local_gives_exact_counts(self):
+        self.remote()
+        self.commit("first remote commit")
+        first = self.oid()
+        self.commit("second remote commit")
+        second = self.oid()
+        self.git("reset", "-q", "--hard", self.root)
+        self.git("update-ref", "refs/remotes/origin/main", first)
+        short = self.git("rev-parse", "--short", second).strip()
+        head = self.head_against_remote(second, "--no-github")
+        self.assertEqual(self.freshness_line(head), "⚠ remote branch is 1 commit ahead; "
+                         "to view: git log --oneline origin/main.." + short)
+        self.assertIn("upstream  ↓1 behind cached origin/main  (", head)
+        self.assertEqual(self.freshness_line(self.head_against_remote(self.root, "--no-github")),
+                         "⚠ remote branch was rewound: 1 commit removed")
+        self.git("checkout", "-q", "--detach", self.root)
+        self.commit("rewritten remote commit")
+        rewritten = self.oid()
+        self.git("checkout", "-q", "main")
+        self.assertEqual(self.freshness_line(self.head_against_remote(rewritten, "--no-github")),
+                         "⚠ remote branch was rewritten (force-push?): 1 new, 1 removed")
+        self.assertFalse(set().union(*(args for tool, args in self.recorded() if tool == "git"))
+                         & {"fetch", "push", "clone"})
+
+    def test_unfetched_remote_tip_is_counted_by_github_compare(self):
+        self.remote()
+        self.git("remote", "set-url", "origin", "git@github.com:owner/repo.git")
+        self.gh()
+        tip = "1" * 40
+        cases = (({"status": "ahead", "ahead_by": 3, "behind_by": 0}, "0",
+                  "⚠ remote branch is 3 commits ahead; to view: git fetch && git log --oneline ..@{u}"),
+                 ({"status": "diverged", "ahead_by": 2, "behind_by": 1}, "0",
+                  "⚠ remote branch was rewritten (force-push?): 2 new, 1 removed"),
+                 ({"status": "ahead", "ahead_by": -1, "behind_by": 0}, "0",
+                  "⚠ remote branch has changed since your fetch; "
+                  "to view: git fetch && git log --oneline ..@{u}"),
+                 ({}, "1", "⚠ remote branch has changed since your fetch; "
+                           "to view: git fetch && git log --oneline ..@{u}"))
+        for response, rc, expected in cases:
+            with self.subTest(response=response, rc=rc):
+                head = self.head_against_remote(tip, env={
+                    "OVERVIEW_TEST_COMPARE": json.dumps(response), "OVERVIEW_TEST_COMPARE_RC": rc,
+                    "COLUMNS": "120"})
+                self.assertEqual(self.freshness_line(head), expected)
+        compares = [args for tool, args in self.recorded() if tool == "gh" and "graphql" not in args]
+        self.assertEqual(len(compares), len(cases))
+        self.assertTrue(all(args == ["api", f"repos/owner/repo/compare/{self.root}...{tip}?per_page=1"]
+                            for args in compares), compares)
+
+    def test_github_compare_needs_github_remote_and_lookups_enabled(self):
+        self.remote()
+        self.gh()
+        compare = {"OVERVIEW_TEST_COMPARE": json.dumps({"status": "ahead", "ahead_by": 3, "behind_by": 0})}
+        for url, args in ((None, ()), ("https://github.com/owner/repo", ("--no-github",)),
+                          ("https://gitlab.com/owner/repo.git", ())):
+            with self.subTest(url=url, args=args):
+                if url:
+                    self.git("remote", "set-url", "origin", url)
+                head = self.head_against_remote("1" * 40, *args, env=compare)
+                self.assertIn("remote branch has changed", head)
+        self.assertFalse(any(tool == "gh" and "graphql" not in args for tool, args in self.recorded()))
+
+    def test_diverged_branch_predicts_conflicts_without_writing(self):
+        self.remote()
+        self.commit("remote edit", "remote\n")
+        self.git("update-ref", "refs/remotes/origin/main", self.oid())
+        self.git("reset", "-q", "--hard", self.root)
+        (self.repo / "other").write_text("local\n")
+        self.git("add", "other")
+        self.commit("unrelated local edit")
+        head = self.section(self.output("--no-check-remote", "--no-github"), "HEAD")
+        self.assertIn("↑1 ahead, ↓1 behind cached origin/main; would merge cleanly", head)
+        self.commit("conflicting local edit", "local\n")
+        before = self.snapshot(self.repo)
+        head = self.section(self.output("--no-check-remote", "--no-github"), "HEAD")
+        self.assertIn("↑2 ahead, ↓1 behind cached origin/main; 1 file would conflict", head)
+        self.assertEqual(before, self.snapshot(self.repo))
+        self.git("reset", "-q", "--hard", "HEAD~2")
+        self.assertNotIn("would", self.section(self.output("--no-check-remote", "--no-github"), "HEAD"))
+
+    def test_freshness_hint_wraps_at_narrow_widths(self):
+        self.remote()
+        for width in (60, 80):
+            with self.subTest(width=width):
+                head = self.head_against_remote("1" * 40, "--no-github", env={"COLUMNS": str(width)})
+                self.assertTrue(all(len(line) <= width for line in head.splitlines()), head)
+                self.assertIn("git fetch && git log --oneline ..@{u}", head)
 
     def test_missing_tracking_ref_distinguishes_deleted_and_unfetched(self):
         self.remote(tracking=False)
@@ -498,19 +613,55 @@ print(os.environ['OVERVIEW_TEST_GITHUB'])
             with self.subTest(expected=expected):
                 head = self.section(self.output("--no-github", env={
                     "OVERVIEW_TEST_REMOTE": response, "OVERVIEW_TEST_REMOTE_RC": "0"}), "HEAD")
-                self.assertIn("no remote-tracking ref", head)
+                self.assertIn("upstream  no cached origin/main", head)
                 self.assertIn(expected, head)
-                self.assertNotIn("in sync", head)
+                self.assertNotIn("even with", head)
         head = self.section(self.output("--no-check-remote", "--no-github"), "HEAD")
         self.assertIn("deleted upstream, or never fetched here", head)
+
+    def test_fetch_age_includes_pushes_and_clones_from_tracking_reflog(self):
+        self.remote()
+        cases = (("update by push", 7200, "(pushed 2h ago)"),
+                 ("clone: from https://example.com/repo", 7200, "(cloned 2h ago)"),
+                 ("fetch origin: fast-forward", 7200, "(fetched 2h ago)"),
+                 ("update by push", 5 * 86400, "(fetched 2d ago)"))
+        for message, age, expected in cases:
+            with self.subTest(message=message, age=age):
+                # Deleting the ref drops its reflog; an unchanged ref logs nothing.
+                self.git("update-ref", "-d", "refs/remotes/origin/main")
+                self.git("update-ref", "-m", message, "refs/remotes/origin/main", self.root,
+                         env={"GIT_COMMITTER_DATE": f"{NOW - age} +0000"})
+                head = self.section(self.output("--no-check-remote", "--no-github"), "HEAD")
+                self.assertIn(expected, head)
+        # A clone logs only origin/HEAD, not the tracking refs it writes.
+        shutil.rmtree(self.repo / ".git" / "logs" / "refs" / "remotes")
+        for message, expected in (("remote set-head", "(fetched 2d ago)"),
+                                  ("clone: from https://example.com/repo", "(cloned 2h ago)")):
+            with self.subTest(head_message=message):
+                self.git("symbolic-ref", "-m", message, "refs/remotes/origin/HEAD",
+                         "refs/remotes/origin/main", env={"GIT_COMMITTER_DATE": f"{NOW - 7200} +0000"})
+                self.assertIn(expected, self.section(self.output("--no-check-remote", "--no-github"), "HEAD"))
+                shutil.rmtree(self.repo / ".git" / "logs" / "refs" / "remotes")
+        (self.repo / ".git" / "FETCH_HEAD").unlink()
+        self.assertIn("(no fetch recorded)",
+                      self.section(self.output("--no-check-remote", "--no-github"), "HEAD"))
+
+    def test_branch_without_upstream_names_matching_tracking_ref(self):
+        self.git("remote", "add", "origin", str(self.base / "absent-remote"))
+        head = self.section(self.output("--no-check-remote", "--no-github"), "HEAD")
+        self.assertIn("upstream  none — no upstream set", head)
+        self.git("update-ref", "refs/remotes/origin/main", self.root)
+        head = self.section(self.output("--no-check-remote", "--no-github"), "HEAD")
+        self.assertIn("none — not tracking origin/main (git branch -u origin/main)", head)
+        self.assertNotIn("✓", head)
 
     def test_remote_timeout_is_not_confirmation(self):
         self.remote()
         start = time.monotonic()
         head = self.section(self.output("--no-github", env={"OVERVIEW_TEST_TIMEOUT": "git"}), "HEAD")
         self.assert_timeout(start, 5)
-        self.assertIn("remote unreachable", head)
-        self.assertNotIn("checked just now", head)
+        self.assertIn("couldn't reach origin to check", head)
+        self.assertNotIn("up to date with remote", head)
         self.assertTrue(any(tool == "git" and "ls-remote" in args
                             for tool, args in self.recorded()))
 
@@ -818,7 +969,7 @@ print(os.environ['OVERVIEW_TEST_GITHUB'])
             "OVERVIEW_TEST_FAIL": json.dumps(["rev-list"])}), "HEAD")
         self.assertIn("ahead/behind unavailable", head)
         self.assertIn("fetched 9d ago — stale", head)
-        self.assertNotIn("in sync", head)
+        self.assertNotIn("even with", head)
 
     def test_width_clamps_without_terminal_utilities(self):
         for requested, expected in (("30", 60), ("200", 120), ("bad", 80)):

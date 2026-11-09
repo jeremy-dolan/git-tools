@@ -2,14 +2,15 @@
 """git-overview — one-screen bird's-eye view of local git state.
 
 Strictly read-only: never fetches, writes refs, or refreshes the index.
-Remote advertisements confirm whether locally computed counts are current.
+Remote advertisements show whether the cached upstream ref is current, and
+by how much it lags when the commits are local or the remote is on GitHub.
 Requires Python 3.8+ and Git; authenticated GitHub CLI (gh) is optional.
 
 Usage: git-overview [--no-check-remote] [--no-github] [-n N | --all-branches]
                     [--color[=WHEN]] [--no-color] [--help]
 
  --no-check-remote  skip the upstream freshness check
- --no-github        skip the GitHub PR and issue lookup
+ --no-github        skip the GitHub PR, issue, and commit-compare lookups
  -n N               show at most N branches (default = 12, 0 for no limit)
  --all-branches     same as -n 0
  --color[=WHEN]     always, never, or auto (default auto; bare --color = always)
@@ -30,6 +31,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -276,8 +278,14 @@ class Head:
     commit: list
     operations: list
     counts: tuple = None
+    conflicts: int = None
     fetch_ts: int = None
+    fetch_verb: str = "fetched"
+    tracked_elsewhere: str = ""
+    # "", same, ahead, changed, rewound, rewritten, gone, unfetched, or error
     remote_state: str = ""
+    remote_counts: tuple = None
+    remote_tip: str = ""
 
 
 def read_file(path):
@@ -324,13 +332,17 @@ def collect_head(git, options):
     except OSError:
         pass
     if head.upstream:
+        last_update(git, head)
         result = git.run("rev-list", "--left-right", "--count", head.upstream + "...HEAD")
-        if result.ok:
-            try:
-                behind, ahead = map(int, result.data.split())
-                head.counts = behind, ahead
-            except ValueError:
-                pass
+        head.counts = count_pair(result.data) if result.ok else None
+        if head.counts and all(head.counts):
+            head.conflicts = predict_conflicts(git, head.upstream)
+    elif branch and not head.merge:
+        # Pushed without -u leaves a tracking ref but no upstream setting.
+        for remote in git.text("remote").splitlines():
+            if git.run("rev-parse", "--verify", "--quiet", "refs/remotes/" + remote + "/" + branch).ok:
+                head.tracked_elsewhere = remote + "/" + branch
+                break
     if options.check_remote and head.remote and head.merge:
         have = git.text("rev-parse", "--verify", "--quiet", "refs/remotes/" + head.upstream) if head.upstream else ""
         # ls-remote reads advertised refs without downloading objects, moving
@@ -354,9 +366,117 @@ def collect_head(git, options):
             head.remote_state = "gone"
         elif not have:
             head.remote_state = "unfetched"
+        elif advertised[head.merge] == have:
+            head.remote_state = "same"
         else:
-            head.remote_state = "same" if advertised[head.merge] == have else "moved"
+            compare_remote(git, head, have, advertised[head.merge], options)
     return head
+
+
+def last_update(git, head):
+    """Date the cached upstream ref by its newest reflog entry if FETCH_HEAD is older.
+
+    FETCH_HEAD only records fetches; the tracking ref's reflog also records
+    pushes. Clone writes tracking refs without a reflog, logging only
+    <remote>/HEAD, so fall back to that entry when it is the clone's.
+    """
+    for ref, prefixes in ((head.upstream, ("",)), (head.remote + "/HEAD", ("clone",))):
+        entry = records(git.run("reflog", "show", "-1", "-z", "--date=unix", "--format=%gd%x00%gs",
+                                "refs/remotes/" + ref, "--"), 2)
+        if entry:
+            break
+    else:
+        return
+    selector, subject = entry[0]
+    match = re.search(r"@\{(\d+)\}$", selector)
+    if not match or not subject.startswith(prefixes):
+        return
+    timestamp = int(match.group(1))
+    if head.fetch_ts is None or timestamp > head.fetch_ts:
+        head.fetch_ts = timestamp
+        head.fetch_verb = next((verb for prefix, verb in (
+            ("fetch", "fetched"), ("pull", "fetched"), ("update by push", "pushed"),
+            ("clone", "cloned")) if subject.startswith(prefix)), "updated")
+
+
+def count_pair(data):
+    try:
+        left, right = map(int, data.split())
+        return left, right
+    except ValueError:
+        return None
+
+
+def predict_conflicts(git, upstream):
+    """Number of files a merge of upstream would conflict in, or None.
+
+    merge-tree writes the merge's objects even with --quiet, so point object
+    writes at a throwaway directory and borrow the repository's objects as an
+    alternate. The repository itself stays untouched.
+    """
+    objects = git.text("rev-parse", "--path-format=absolute", "--git-path", "objects")
+    if not objects:
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="git-overview-") as scratch:
+            result = git.run("merge-tree", "--write-tree", "--name-only", "--no-messages", "-z",
+                             "HEAD", upstream, timeout=10,
+                             env={"GIT_OBJECT_DIRECTORY": scratch,
+                                  "GIT_ALTERNATE_OBJECT_DIRECTORIES": objects})
+    except OSError:
+        return None
+    fields = result.data.split(b"\0")
+    if result.timed_out or len(fields) < 2 or fields.pop() != b"":
+        return None
+    if result.ok:
+        return 0 if len(fields) == 1 else None
+    # Exit status 1 means conflicts; anything else (old Git, bad ref) is
+    # indistinguishable here, so require the conflicted-file list to be present.
+    return len(fields) - 1 or None
+
+
+def github_repository(url):
+    match = re.fullmatch(r"(?:https://(?:[^@/]+@)?github\.com/|(?:ssh://)?git@github\.com[:/])"
+                         r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?", url)
+    return match.groups() if match else None
+
+
+def github_compare(git, remote, base, tip, options):
+    """(removed, added) commits from base to tip per GitHub, or None."""
+    if options.github_skipped or not shutil.which("gh"):
+        return None
+    repository = github_repository(git.text("remote", "get-url", remote))
+    if not repository:
+        return None
+    result = run(["gh", "api", "repos/%s/%s/compare/%s...%s?per_page=1" % (*repository, base, tip)],
+                 env=network_env(), timeout=6)
+    if not result.ok:
+        return None
+    try:
+        payload = json.loads(result.data)
+        counts = payload["behind_by"], payload["ahead_by"]
+        if (payload["status"] in ("ahead", "behind", "diverged", "identical")
+                and all(type(n) is int and n >= 0 for n in counts)):
+            return counts
+    except (ValueError, UnicodeError, KeyError, TypeError):
+        pass
+    return None
+
+
+def compare_remote(git, head, have, tip, options):
+    """Classify how the remote branch differs from the cached tracking ref."""
+    counts = None
+    if git.run("cat-file", "-e", tip + "^{commit}").ok:
+        result = git.run("rev-list", "--left-right", "--count", have + "..." + tip)
+        counts = count_pair(result.data) if result.ok else None
+        if counts:
+            head.remote_tip = git.text("rev-parse", "--short", tip)
+    else:
+        counts = github_compare(git, head.remote, have, tip, options)
+    removed, added = counts or (0, 0)
+    head.remote_counts = counts
+    head.remote_state = ("rewritten" if removed and added else "rewound" if removed
+                         else "ahead" if added else "changed")
 
 
 GITHUB_QUERY = """
@@ -509,6 +629,10 @@ def age(timestamp, now):
     return str(seconds // 31536000) + "y"
 
 
+def plural(count, noun):
+    return str(count) + " " + noun + ("" if count == 1 else "s")
+
+
 def calendar(timestamp):
     return datetime.fromtimestamp(int(timestamp)).strftime("%Y-%m-%d")
 
@@ -562,6 +686,8 @@ class Renderer:
             self.field("commit", self.c("no commits yet", "dim"))
         main, plain, note, note_plain = self.upstream(head)
         self.field("upstream", main, plain, note, note_plain, gap=2)
+        if head.upstream:
+            self.freshness(head)
 
     def upstream(self, head):
         note, note_plain = "", ""
@@ -569,50 +695,49 @@ class Renderer:
             plain = "n/a while detached"
             main = self.c(plain, "dim")
         elif head.upstream:
+            # Reads as a sentence about the branch: "[main is] ↑1 ahead of
+            # cached origin/main". "cached": as of the last fetch, not live.
             if head.counts is None:
-                sync = "(ahead/behind unavailable)"
-                colored = self.c(sync, "red", "bold")
+                relation = "ahead/behind unavailable for"
+                colored = self.c("ahead/behind unavailable", "red", "bold") + " " + self.c("for", "dim")
             elif head.counts == (0, 0):
-                sync, colored = "in sync", self.c("in sync", "green")
+                relation = "even with"
+                colored = self.c("even", "green") + " " + self.c("with", "dim")
             else:
                 behind, ahead = head.counts
-                pieces = [(f"↑{ahead} ahead", "yellow")] if ahead else []
-                if behind:
-                    pieces.append((f"↓{behind} behind", "yellow"))
-                sync = "  ".join(text for text, _ in pieces)
-                colored = "  ".join(self.c(text, color) for text, color in pieces)
-            plain = visible(head.upstream) + "  " + sync
-            main = visible(head.upstream) + "  " + colored
+                relation = ", ".join(([f"↑{ahead} ahead"] if ahead else [])
+                                     + ([f"↓{behind} behind"] if behind else []))
+                colored = self.c(relation, "yellow")
+                if not behind:
+                    relation += " of"
+                    colored += " " + self.c("of", "dim")
+            target = visible(head.upstream)
+            plain = relation + " cached " + target
+            main = colored + " " + self.c("cached", "dim") + " " + target
+            if head.conflicts is not None:
+                outcome, color = ((plural(head.conflicts, "file") + " would conflict", "red")
+                                  if head.conflicts else ("would merge cleanly", "dim"))
+                plain += "; " + outcome
+                main += "; " + self.c(outcome, color)
             fetched = age(head.fetch_ts, self.now) if head.fetch_ts is not None else ""
-            if head.remote_state == "same":
-                note_plain = "(checked just now)"
-                note = self.c(note_plain, "dim")
-            elif head.remote_state in ("moved", "gone"):
-                if head.remote_state == "gone":
-                    message = visible(head.merge + " no longer exists on " + head.remote)
-                    color = "red"
-                else:
-                    message = ("remote moved since your fetch " + fetched + " ago — counts stale" if fetched
-                               else "remote has commits you have never fetched — counts stale")
-                    color = "yellow"
-                note_plain = "⚠ " + message
-                note = self.c(note_plain, color)
-            else:
-                elapsed = self.now - head.fetch_ts if fetched else 0
+            elapsed = self.now - head.fetch_ts if fetched else 0
+            message = head.fetch_verb + " " + fetched + " ago" if fetched else "no fetch recorded"
+            # Once the remote has answered, the freshness line says whether the
+            # cached ref is current; the fetch age alone needs no alarm.
+            if head.remote_state in ("", "error"):
                 color = ("yellow",) if not fetched or elapsed > 86400 else ("dim",)
-                message = "fetched " + fetched + " ago" if fetched else "never fetched"
                 if fetched and elapsed > 604800:
                     message += " — stale"
                     color = ("red", "bold")
-                if head.remote_state == "error":
-                    message += "; remote unreachable"
-                note_plain = "(" + message + ")"
-                note = self.c(note_plain, *color)
+            else:
+                color = ("dim",)
+            note_plain = "(" + message + ")"
+            note = self.c(note_plain, *color)
         elif head.remote and head.merge:
             merge = head.merge[11:] if head.merge.startswith("refs/heads/") else head.merge
             target = visible(head.remote + "/" + merge)
-            plain = target + "  no remote-tracking ref"
-            main = target + "  " + self.c("no remote-tracking ref", "red")
+            plain = "no cached " + target
+            main = self.c("no cached", "red") + " " + target
             if head.remote_state in ("gone", "unfetched"):
                 message, color = (("deleted on the remote", "red") if head.remote_state == "gone"
                                   else ("it exists on the remote — fetch to compare", "yellow"))
@@ -622,10 +747,46 @@ class Renderer:
                 note_plain = "(deleted upstream, or never fetched here)"
                 note = self.c(note_plain, "dim")
         else:
-            plain = ("none — " + visible(head.branch) + " has never been pushed" if head.has_remote
-                     else "none — no remote configured")
+            if head.tracked_elsewhere:
+                target = visible(head.tracked_elsewhere)
+                plain = "none — not tracking " + target + " (git branch -u " + target + ")"
+            else:
+                plain = "none — no upstream set" if head.has_remote else "none — no remote configured"
             main = self.c(plain, "dim")
         return main, plain, note, note_plain
+
+    def freshness(self, head):
+        """One line on whether the cached upstream ref matches the remote branch."""
+        state = head.remote_state
+        if not state:
+            return
+        indent = " " * 12
+        if state == "same":
+            print(indent + self.c("✓", "green") + self.c(" up to date with remote", "dim"))
+            return
+        removed, added = head.remote_counts or (0, 0)
+        merge = head.merge[11:] if head.merge.startswith("refs/heads/") else head.merge
+        message, color = {
+            "ahead": ("remote branch is " + plural(added, "commit") + " ahead", "yellow"),
+            "changed": ("remote branch has changed since your fetch", "yellow"),
+            "rewound": ("remote branch was rewound: " + plural(removed, "commit") + " removed", "red"),
+            "rewritten": ("remote branch was rewritten (force-push?): "
+                          + str(added) + " new, " + str(removed) + " removed", "red"),
+            "gone": (visible(merge) + " no longer exists on " + visible(head.remote), "red"),
+        }.get(state, ("couldn't reach " + visible(head.remote) + " to check", "yellow"))
+        message = "⚠ " + message
+        hint = ""
+        if state in ("ahead", "changed"):
+            # git log can only show commits already in the local object store.
+            hint = ("git log --oneline " + visible(head.upstream) + ".." + head.remote_tip
+                    if head.remote_tip else "git fetch && git log --oneline ..@{u}")
+        if not hint:
+            print(indent + self.c(clip(self.cols - 12, message), color))
+        elif 12 + len(message) + len("; to view: ") + len(hint) <= self.cols:
+            print(indent + self.c(message, color) + self.c("; to view: ", "dim") + hint)
+        else:
+            print(indent + self.c(clip(self.cols - 12, message), color))
+            print(indent + "  " + self.c("to view: ", "dim") + clip(self.cols - 23, hint))
 
     def status_summary(self, status, detailed=False):
         pieces = []
