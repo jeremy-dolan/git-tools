@@ -3,7 +3,7 @@
 Build the fictional park-control repository from the git-tools root:
 
 ```sh
-python3 assets/create-jurassic-park.py
+python3 assets/build-jurassic-park.py
 ```
 
 The generated repositories are ignored. The builder refuses to overwrite
@@ -14,7 +14,7 @@ To push the prepared history to the private `jeremy-dolan/jurassic-park` repo
 and add three PRs, two issues, and demo commit statuses:
 
 ```sh
-python3 assets/create-jurassic-park.py --publish
+python3 assets/build-jurassic-park.py --publish
 ```
 
 This requires authenticated Git and GitHub CLI access. The check statuses are
@@ -33,6 +33,14 @@ cd assets/jurassic-park
 COLUMNS=120 ../../bin/git-overview --color
 ```
 
+For a mock screenshot, `git-overview.ansi` can be used directly. Set the window
+title to match, then cat the file and scroll back in history:
+
+```sh
+printf '\e]0;%s\a' 'jhammond@gaia — 󰉋  jurassic-park —  raptor-doors'
+clear; cat assets/git-overview.ansi; echo; echo
+```
+
 The checked-out `feat/raptor-doors` branch is two commits ahead and three behind
 its upstream, with a merge conflict in `security/doors.py`. There are staged,
 modified, and untracked files; five local branches; two additional worktrees;
@@ -46,7 +54,7 @@ in recorded order. Commit dates remain backdated for the branch and tag ages.
 Before publication, preview the full layout without network calls:
 
 ```sh
-COLUMNS=120 python3 assets/create-jurassic-park.py --preview
+COLUMNS=120 python3 assets/build-jurassic-park.py --preview
 ```
 
 This uses the actual local state with simulated GitHub data and the expected

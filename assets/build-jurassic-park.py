@@ -170,8 +170,8 @@ def build(storm_source=None):
     normalize_demo_reflog()
     print("Created " + str(REPO))
     print("Remote: " + URL)
-    print("Preview: python3 assets/create-jurassic-park.py --preview")
-    print("Publish: python3 assets/create-jurassic-park.py --publish")
+    print("Preview: python3 assets/build-jurassic-park.py --preview")
+    print("Publish: python3 assets/build-jurassic-park.py --publish")
 
 
 def api(endpoint, *fields):

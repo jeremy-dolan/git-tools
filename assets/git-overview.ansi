@@ -1,9 +1,12 @@
+[48;5;202m [49m [38;5;202mjhammond@gaia:[36m/prod/jurassic-park [39m% git overview
 
 [1m[36m HEAD ────────────────────────────────────────────────────────────────────────[0m
   [31m[1m⚑ MERGE in progress[0m
   [2mbranch   [0m [1mfeat/raptor-doors[0m
   [2mcommit   [0m [33mf6652a0[0m  Alert when a raptor opens a door  [2m(15m ago)[0m
-  [2mupstream [0m origin/feat/raptor-doors  [33m↑2 ahead[0m  [33m↓3 behind[0m  [2m(checked just now)[0m
+  [2mupstream [0m [33m↑2 ahead, ↓3 behind[0m [2mcached[0m origin/feat/raptor-doors [2m(fetched 8m ago)[0m
+            [31m⚠ 1 file would conflict[0m
+            [32m✓[0m[2m up to date with remote[0m
 
 [1m[36m UNCOMMITTED ─────────────────────────────────────────────────────────────────[0m
   [31m[1m1 conflict[0m   3 staged   [33m2 modified[0m   [2m2 untracked[0m
@@ -46,4 +49,6 @@
   [33m44a3f55 [0m [2m2h ago  [0m merge chore/budget: Merge made by the 'ort' strategy.
   [33m4fbebfd [0m [2m2h ago  [0m checkout: moving from chore/budget to main
   [33m294099c [0m [2m2h ago  [0m commit: Reduce the overnight engineering shift
+
+[48;5;202m [49m [38;5;202mjhammond@gaia:[36m/prod/jurassic-park [39m% [47m [49m
 
