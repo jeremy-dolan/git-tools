@@ -687,6 +687,7 @@ class Renderer:
         main, plain, note, note_plain = self.upstream(head)
         self.field("upstream", main, plain, note, note_plain, gap=2)
         if head.upstream:
+            self.merge_outcome(head)
             self.freshness(head)
 
     def upstream(self, head):
@@ -714,11 +715,6 @@ class Renderer:
             target = visible(head.upstream)
             plain = relation + " cached " + target
             main = colored + " " + self.c("cached", "dim") + " " + target
-            if head.conflicts is not None:
-                outcome, color = ((plural(head.conflicts, "file") + " would conflict", "red")
-                                  if head.conflicts else ("would merge cleanly", "dim"))
-                plain += "; " + outcome
-                main += "; " + self.c(outcome, color)
             fetched = age(head.fetch_ts, self.now) if head.fetch_ts is not None else ""
             elapsed = self.now - head.fetch_ts if fetched else 0
             message = head.fetch_verb + " " + fetched + " ago" if fetched else "no fetch recorded"
@@ -754,6 +750,16 @@ class Renderer:
                 plain = "none — no upstream set" if head.has_remote else "none — no remote configured"
             main = self.c(plain, "dim")
         return main, plain, note, note_plain
+
+    def merge_outcome(self, head):
+        """Whether merging the diverged cached upstream would conflict."""
+        if head.conflicts is None:
+            return
+        indent = " " * 12
+        if head.conflicts:
+            print(indent + self.c("⚠ " + plural(head.conflicts, "file") + " would conflict", "red"))
+        else:
+            print(indent + self.c("✓", "green") + self.c(" would merge cleanly", "dim"))
 
     def freshness(self, head):
         """One line on whether the cached upstream ref matches the remote branch."""
